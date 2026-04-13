@@ -1024,6 +1024,16 @@ class GenomicDataModule(pl.LightningDataModule):
                 epi_stats=stats,
                 **kwargs
             )
+            self.test_set = df_class(
+                chrom_sizes=self.chrom_sizes,
+                seq_dict=self.seq_dict,
+                bw_dir=self.local_bw_dirs,
+                epi_features=self.epi_features,
+                window_size=self.window_size,
+                num_samples=1,
+                epi_stats=stats,
+                **kwargs
+            )
 
     def train_dataloader(self):
        
@@ -1118,7 +1128,10 @@ class GenomicDataModule(pl.LightningDataModule):
         return all_targets, centers, y, counts, strands, idx_to_chrom, chrom_indices, bw_indices
     
     def train_val_test_split(self):
-        test_mask = torch.from_numpy(self.df["GuideID"].isin(self.test_guides).values)
+        if self.test_guides is None:
+            test_mask = torch.zeros(len(self.df), dtype=torch.bool)
+        else:
+            test_mask = torch.from_numpy(self.df["GuideID"].isin(self.test_guides).values)
         if self.val_guides is None:
             val_mask = torch.zeros(test_mask.shape, dtype=test_mask.dtype)
         elif len(self.val_guides):
