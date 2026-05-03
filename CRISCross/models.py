@@ -800,7 +800,10 @@ def get_lora_config(r: int = 8, alpha: int = 16, dropout: float = 0.1):
     return LoraConfig(
         r=r,
         lora_alpha=alpha,
-        target_modules=["out_proj", "mlp.0", "mlp.3"],
+        # Use fully-qualified suffixes to avoid matching CRISCross.out_proj (a Sequential).
+        # "out_proj" alone would match that Sequential and crash; these only match the
+        # nn.Linear out_proj inside nn.MultiheadAttention (self_attn / cross_attn).
+        target_modules=["self_attn.out_proj", "cross_attn.out_proj", "mlp.0", "mlp.3"],
         lora_dropout=dropout,
         bias="none",
     )
