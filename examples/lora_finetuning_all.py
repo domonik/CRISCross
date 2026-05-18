@@ -1,3 +1,5 @@
+import argparse
+import csv
 import os
 
 import pandas as pd
@@ -5,7 +7,8 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from peft import get_peft_model
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 from torchmetrics.classification import BinaryAveragePrecision
 
 from CRISCross.Datasets import GenomicDataModule
@@ -68,11 +71,13 @@ class CRISPRLoraWrapper(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         target_x, off_target_x, epi, y, counts, strands = batch
         logits = self(target_x, off_target_x, epi, strands).squeeze(1)
+        loss = self.criterion(logits, y.float())
         preds = torch.sigmoid(logits)
         self.auprc.update(preds, y.int())
         auprc = self.auprc.compute()
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val_auprc", auprc, on_epoch=True, prog_bar=True)
-        return {"val_auprc": auprc}
+        return {"val_loss": loss, "val_auprc": auprc}
 
     def configure_optimizers(self):
         # Only pass parameters that require gradients (i.e. LoRA adapter weights).
@@ -81,8 +86,18 @@ class CRISPRLoraWrapper(pl.LightningModule):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test_guide", type=str, required=True,
+                        help="GuideID to hold out as the test set (e.g. sg7)")
+    parser.add_argument("--results_file", type=str, default="results/loso_results.csv",
+                        help="CSV file to append per-guide AUPRC results")
+    parser.add_argument("--accelerator", type=str, default="gpu", choices=["gpu", "cpu"],
+                        help="Device to train on. Use 'cpu' if no GPU is available.")
+    args = parser.parse_args()
+
+    TEST_GUIDE = args.test_guide
     PRETRAINED_URL = "https://huggingface.co/domonik/criscross-atac/resolve/main/model.pt"
-    LORA_SAVE_DIR = "lora_adapter"
+    LORA_SAVE_DIR = f"lora_adapters/{TEST_GUIDE}"
 
     cfg = {
         "vocab_size": 5,
@@ -97,16 +112,18 @@ if __name__ == "__main__":
 
     # ============ Load Data ============
     df = pd.read_csv("datasets/TCellDataset.tsv", sep="\t")
-    test_guides = [df.iloc[0]["GuideID"]]
-    val_guides = []
+
+    all_guides = sorted(df["GuideID"].unique().tolist())
+    if TEST_GUIDE not in all_guides:
+        raise ValueError(f"--test_guide '{TEST_GUIDE}' not found. Available: {all_guides}")
 
     datamodule = GenomicDataModule(
         fasta_path="data/GRCh38.primary_assembly.genome.fa",
         epi_features=["ATAC"],
         bw_dir="AGTensorsCL:0000624",
         df=df,
-        test_guides=test_guides,
-        val_guides=val_guides,
+        test_guides=[TEST_GUIDE],
+        val_guides=[],           # empty list → random 20% of train rows used as val
         batch_size=256,
         window_size=512,
         num_samples=256 * 10,
@@ -115,28 +132,40 @@ if __name__ == "__main__":
 
     # ============ Load Pretrained Model + LoRA ============
     peft_model = load_criscross_with_lora(PRETRAINED_URL, cfg, lora_r=8, lora_alpha=16)
-    peft_model.print_trainable_parameters()  # Should show ~1-2% trainable
+    peft_model.print_trainable_parameters()
 
     lightning_model = CRISPRLoraWrapper(peft_model, lr=1e-4)
 
     # ============ Train ============
     checkpoint_callback = ModelCheckpoint(
+        dirpath=f"checkpoints/{TEST_GUIDE}",
         monitor="val_auprc",
         mode="max",
         filename="best-lora-model",
         save_top_k=1,
     )
 
+    early_stop_callback = EarlyStopping(
+        monitor="val_auprc",
+        mode="max",
+        patience=5,
+        verbose=True,
+    )
+
+    tb_logger = TensorBoardLogger(save_dir="logs", name=f"lora_{TEST_GUIDE}")
+
+    precision = "bf16-mixed" if args.accelerator == "gpu" else "32"
+
     trainer = pl.Trainer(
-        max_epochs=5,
-        accelerator="gpu",
-        precision="bf16-mixed",
-        callbacks=[checkpoint_callback],
+        max_epochs=70,
+        accelerator=args.accelerator,
+        precision=precision,
+        callbacks=[checkpoint_callback, early_stop_callback],
+        logger=tb_logger,
     )
     trainer.fit(lightning_model, datamodule)
 
     # ============ Save LoRA Adapter ============
-    # Saves only the adapter weights (~1-10 MB) rather than the full model (~200 MB).
     os.makedirs(LORA_SAVE_DIR, exist_ok=True)
     peft_model.save_pretrained(LORA_SAVE_DIR)
     print(f"LoRA adapter saved to: {LORA_SAVE_DIR}")
@@ -146,6 +175,7 @@ if __name__ == "__main__":
     lightning_model.eval()
     lightning_model.to(device)
 
+    auprc_metric = BinaryAveragePrecision().to(device)
     all_probs = []
     all_labels = []
 
@@ -159,11 +189,35 @@ if __name__ == "__main__":
 
             logits = lightning_model(target_x, off_target_x, epi, strands).squeeze(1)
             probs = torch.sigmoid(logits)
+            auprc_metric.update(probs, y.int())
             all_probs.extend(probs.cpu().numpy())
             all_labels.extend(y.cpu().numpy())
 
-    print(f"Total predictions: {len(all_probs)}")
-    print(f"Sample predictions: {all_probs[:5]}")
-    print(f"Sample labels: {all_labels[:5]}")
-    print("Success")
+    test_auprc = auprc_metric.compute().item()
+    print(f"[{TEST_GUIDE}] Test AUPRC: {test_auprc:.4f}")
+
+    # ============ Save Result ============
+    os.makedirs(os.path.dirname(args.results_file), exist_ok=True)
+    best_val_auprc = checkpoint_callback.best_model_score.item()
+
+    fields = ["guide_id", "val_auprc", "test_auprc", "n_test_samples"]
+    new_row = {
+        "guide_id": TEST_GUIDE,
+        "val_auprc": round(best_val_auprc, 4),
+        "test_auprc": round(test_auprc, 4),
+        "n_test_samples": len(all_probs),
+    }
+
+    # Read existing rows, drop any previous entry for this guide, then write back.
+    existing = []
+    if os.path.exists(args.results_file):
+        with open(args.results_file, newline="") as f:
+            existing = [r for r in csv.DictReader(f) if r["guide_id"] != TEST_GUIDE]
+
+    with open(args.results_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(existing)
+        writer.writerow(new_row)
+    print(f"Result saved to: {args.results_file}")
 
