@@ -550,12 +550,14 @@ def mutate_target(target, alphabet=(1, 2, 3, 4)):
 
 
 class GenomicDataset(Dataset):
-    def __init__(self, chrom_sizes, seq_dict, bw_dir, epi_features, window_size=1000, num_samples=10000, epi_stats = None):
+    def __init__(self, chrom_sizes, seq_dict, bw_dir, epi_features, window_size=1000, num_samples=10000, epi_stats=None, atac_features=None, atac_stats=None):
         """
         chrom_sizes: dict of {chrom: length}, e.g., {'chr1': 248956422, ...}
         bigwig_paths: list of paths to bigwig files (each a feature track)
         window_size: length of the region to sample
         num_samples: number of random regions to generate
+        atac_features: track names loaded as regression targets only (not model inputs)
+        atac_stats: dict with "mean" and "std" tensors for ATAC normalization
         """
         self.chrom_sizes = chrom_sizes
         self.bw_dir = bw_dir
@@ -570,6 +572,11 @@ class GenomicDataset(Dataset):
             self.epi_std  = torch.tensor([s["std"] for s in self.epi_stats]).clamp_min(1e-6)
             self.epi_log_mask = torch.tensor([
                 s["mode"] in ("COUNT", "SPARSE_HEAVY") for s in self.epi_stats])
+        self.atac_features = atac_features or []
+        self.atac_stats = atac_stats
+        if self.atac_stats:
+            self.atac_mean = torch.as_tensor(atac_stats["mean"], dtype=torch.float32)
+            self.atac_std = torch.as_tensor(atac_stats["std"], dtype=torch.float32).clamp_min(1e-6)
 
     def __len__(self):
         return self.num_samples
@@ -580,7 +587,7 @@ class GenomicDataset(Dataset):
         max_start = self.chrom_sizes[chrom] - self.window_size
         if max_start <= 0:
             raise ValueError(f"Chromosome {chrom} is shorter than window_size")
-        
+
         # Randomly choose a start position
         while True:
             start = random.randint(0, max_start)
@@ -600,35 +607,50 @@ class GenomicDataset(Dataset):
         target_x = off_target_x[center-23 // 2 - 1: center + 23 // 2].clone()
         target_x = mutate_target(target_x)
 
-        # Read each BigWig feature for this region
+        # Pick ONE bw_dir per sample so all tracks are from the same cell type
+        bw_dir = np.random.choice(self.bw_dir)
+
+        # Read histone/epi features for this region (used as model inputs)
         features = []
         for epi_feat in self.epi_features:
-            bw_dir = np.random.choice(self.bw_dir)
             file = os.path.join(bw_dir, f"{epi_feat}_{chrom}.npy")
-            #file = os.path.join(self.bw_dir, f"{epi_feat}.bw")
             feat = np.memmap(file, dtype=np.float32, mode="r", shape=self.chrom_sizes[chrom])
-            #with pyBigWig.open(file) as bw:
-            #feat = bw.values(chrom, start, end, numpy=True)
             feat = feat[start:end]
             t = torch.from_numpy(feat.copy())
             features.append(t)
         if len(features):
-                
-            epi = torch.stack(features, axis=-1)
+            epi = torch.stack(features, axis=-1)  # [window_size, num_epi]
             epi.nan_to_num_(0)
             if self.epi_stats:
                 epi[:, self.epi_log_mask] = torch.log1p(epi[:, self.epi_log_mask])
                 epi = (epi - self.epi_mean) / self.epi_std
             if not strand:
-                epi = epi.flip(-1)
-
-        #epi = torch.log(epi + 1e-7)
+                epi = epi.flip(0)  # flip spatial dimension for reverse complement
         else:
             epi = 0
+
+        # Read ATAC features for this region (used as regression targets, not model inputs)
+        atac_list = []
+        for atac_feat in self.atac_features:
+            file = os.path.join(bw_dir, f"{atac_feat}_{chrom}.npy")
+            feat = np.memmap(file, dtype=np.float32, mode="r", shape=self.chrom_sizes[chrom])
+            feat = feat[start:end]
+            t = torch.from_numpy(feat.copy())
+            atac_list.append(t)
+        if atac_list:
+            atac = torch.stack(atac_list, dim=-1)  # [window_size, num_atac]
+            atac.nan_to_num_(0)
+            atac = torch.log1p(atac)  # ATAC is always count/sparse — log1p stabilises scale
+            if self.atac_stats:
+                atac = (atac - self.atac_mean) / self.atac_std
+            if not strand:
+                atac = atac.flip(0)  # flip spatial dimension for reverse complement
+        else:
+            atac = torch.zeros(self.window_size, 0)
+
         y = 0
         counts = 0
-        # Shape: [num_features, window_size]
-        return target_x, off_target_x, epi, y, counts, strand
+        return target_x, off_target_x, epi, y, counts, strand, atac
 
     def close(self):
         for bw in self.bigwigs:
@@ -722,7 +744,7 @@ class EnergyGenomicDataset(GenomicDataset):
         super().__init__( *args, **kwargs)
     
     def __getitem__(self, idx):
-        target_x, off_target_x, epi, y, counts, strands = super().__getitem__(idx)
+        target_x, off_target_x, epi, y, counts, strands, atac = super().__getitem__(idx)
         tx = target_x.cpu().numpy()
         target_seq = b''.join(REV_MAPPING[tx]).decode('ascii')       # reverse            # complement                 # move to CPU if needed
         #target_seq = REVMAP_RNA[COMP_MAPPING[target_x.cpu()].flip(0).numpy()]
@@ -745,8 +767,8 @@ class EnergyGenomicDataset(GenomicDataset):
         )
         if self.energy_stats:
             energy = (energy - self.energy_stats[0]) / self.energy_stats[1]
-    
-        return target_x, off_target_x, epi, y, energy, strands
+
+        return target_x, off_target_x, epi, y, energy, strands, atac
 
 
 
@@ -810,7 +832,7 @@ CHROMOSOME_SIZES = {
 
 
 class GenomicDataModule(pl.LightningDataModule):
-    def __init__(self, fasta_path, epi_features, bw_dir, window_size=512, batch_size=32, num_workers=4, num_samples=10000, norm_epi = False, use_energy = False, mode="np", df=None, val_guides=None, test_guides=None):
+    def __init__(self, fasta_path, epi_features, bw_dir, window_size=512, batch_size=32, num_workers=4, num_samples=10000, norm_epi=False, use_energy=False, mode="np", df=None, val_guides=None, test_guides=None, atac_features=None):
         super().__init__()
         self.chrom_sizes = None
         self.seq_dict = None
@@ -852,6 +874,7 @@ class GenomicDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.num_samples = num_samples
         self.norm_epi = norm_epi
+        self.atac_features = atac_features or []
     
     def _norm_eng(self):
         dataset = EnergyGenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, 10000)
@@ -862,9 +885,31 @@ class GenomicDataModule(pl.LightningDataModule):
     
     def _norm_epi(self):
         dataset = GenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, 10000)
-        dl = DataLoader(dataset, sampler= None, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=False)
+        dl = DataLoader(dataset, sampler=None, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=False)
         stats = estimate_all_stats(dl)
         return stats
+
+    def _norm_atac(self):
+        # Estimate log1p mean/std for ATAC tracks using a small sample.
+        # No epi input features needed here — we only care about the ATAC target values.
+        dataset = GenomicDataset(
+            self.chrom_sizes, self.seq_dict, self.local_bw_dirs,
+            epi_features=[],
+            window_size=self.window_size,
+            num_samples=10000,
+            atac_features=self.atac_features,
+            atac_stats=None,  # no normalisation yet — collect raw log1p values
+        )
+        dl = DataLoader(dataset, sampler=None, batch_size=self.batch_size, num_workers=min(4, self.num_workers), persistent_workers=False)
+        all_atac = []
+        for batch in dl:
+            atac = batch[6].detach().cpu()  # [B, window_size, num_atac] — already log1p'd in dataset
+            all_atac.append(atac.reshape(-1, atac.shape[-1]))
+        all_atac = torch.cat(all_atac, dim=0)  # [N, num_atac]
+        return {
+            "mean": all_atac.mean(dim=0),
+            "std": all_atac.std(dim=0).clamp_min(1e-6),
+        }
     
 
     def prepare_data(self):
@@ -933,7 +978,9 @@ class GenomicDataModule(pl.LightningDataModule):
             kwargs = {"energy_stats": energy_stats}
         else:
             kwargs = {}
-            
+
+        atac_stats = self._norm_atac() if self.atac_features else None
+
         if self.df is not None:
             print("Using Fine Tuning dataset via a dataframe")
             all_targets, centers, y, counts, strands, idx_to_chrom, chrom_indices, bw_indices = self.preprocess_data()
@@ -1012,6 +1059,8 @@ class GenomicDataModule(pl.LightningDataModule):
                 window_size=self.window_size,
                 num_samples=self.num_samples,
                 epi_stats=stats,
+                atac_features=self.atac_features,
+                atac_stats=atac_stats,
                 **kwargs
             )
             self.val_set = df_class(
@@ -1022,6 +1071,8 @@ class GenomicDataModule(pl.LightningDataModule):
                 window_size=self.window_size,
                 num_samples=1,
                 epi_stats=stats,
+                atac_features=self.atac_features,
+                atac_stats=atac_stats,
                 **kwargs
             )
             self.test_set = df_class(
@@ -1032,6 +1083,8 @@ class GenomicDataModule(pl.LightningDataModule):
                 window_size=self.window_size,
                 num_samples=1,
                 epi_stats=stats,
+                atac_features=self.atac_features,
+                atac_stats=atac_stats,
                 **kwargs
             )
 

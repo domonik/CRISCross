@@ -49,7 +49,7 @@ def get_logger(config):
     return logger
 
 class PreTrainModel(pl.LightningModule):
-    def __init__(self, context_layers, hidden_dim, num_epi, dropout, seed, windowsize, merge,epi_weights, lr=1e-4, borders = None, use_energy=False):
+    def __init__(self, context_layers, hidden_dim, num_epi, dropout, seed, windowsize, merge, epi_weights, lr=1e-4, borders=None, use_energy=False, num_atac=0, atac_weight=0.1):
         super().__init__()
         
         if borders is not None:
@@ -99,21 +99,27 @@ class PreTrainModel(pl.LightningModule):
         self.energy_loss_fct = nn.MSELoss()
         self.per_nt_classifier = nn.Linear(hidden_dim, 25)
         self.per_nt_epi_head = nn.Linear(hidden_dim, num_epi)
-        self.auprc = MulticlassAveragePrecision( num_classes=25)
-        self.train_auprc = MulticlassAveragePrecision( num_classes=25)
+        self.auprc = MulticlassAveragePrecision(num_classes=25)
+        self.train_auprc = MulticlassAveragePrecision(num_classes=25)
         self._first_batches_features = []
+
+        self.num_atac = num_atac
+        self.atac_weight = atac_weight
+        self.atac_head = nn.Linear(hidden_dim, num_atac) if num_atac > 0 else None
+        self.atac_loss_fn = nn.MSELoss()
 
 
 
     
     def forward(self, target_x, off_target_x, epi, strands):
-        cls_logits, logits = self.model(target_x, off_target_x, strands, epi)
-        epi_logits = self.per_nt_epi_head(logits)
-        logits = self.per_nt_classifier(logits)
-        return logits, epi_logits, cls_logits
+        cls_logits, hidden = self.model(target_x, off_target_x, strands, epi)
+        epi_logits = self.per_nt_epi_head(hidden)
+        atac_logits = self.atac_head(hidden) if self.atac_head is not None else None
+        logits = self.per_nt_classifier(hidden)
+        return logits, epi_logits, cls_logits, atac_logits
     
     def mask_shit(self, batch):
-        target_x, off_target_x, epi, y, counts, strands = batch
+        target_x, off_target_x, epi, y, counts, strands, atac = batch
         batch_size, seq_len = target_x.shape
         center = off_target_x.shape[1] // 2 + off_target_x.shape[1] % 2
         target_x = target_x.clone()
@@ -183,23 +189,22 @@ class PreTrainModel(pl.LightningModule):
 
 
     def general_step(self, batch):
-        target_x, off_target_x, epi, y, counts, strands = batch
+        target_x, off_target_x, epi, y, counts, strands, atac = batch
         masked_target, masked_ot, epi_masked, mask = self.mask_shit(batch)
         center = off_target_x.shape[1] // 2 + off_target_x.shape[1] % 2
         assert (off_target_x[:, center - 23//2 - 1:center+23//2] == target_x).sum(axis=1).min() >= 15
-       
+
         bs, slen = target_x.shape
         y = self.compute_tokenized_target(target_x=target_x, off_target_x=off_target_x, mask=mask)
         if len(epi.shape) == 1:
-            logits, epi_logits, cls_logits  = self(masked_target, masked_ot, None, strands)
+            logits, epi_logits, cls_logits, atac_logits = self(masked_target, masked_ot, None, strands)
             epi_loss = torch.zeros(epi_logits.shape, device=epi_logits.device)
         else:
-            logits, epi_logits, cls_logits  = self(masked_target, masked_ot, epi_masked, strands)
+            logits, epi_logits, cls_logits, atac_logits = self(masked_target, masked_ot, epi_masked, strands)
             epi_loss = self.epi_loss_fn(epi_logits, epi[:, center - 23//2 - 1:center+23//2]) * mask[..., None]
         masked_loss = self.loss_fn(logits.flatten(start_dim=0, end_dim=1), y.flatten()) * mask[..., None].flatten()
-            
-        clsloss = masked_loss.sum() / mask.sum()
 
+        clsloss = masked_loss.sum() / mask.sum()
         epi_loss = epi_loss.sum(dim=(0,1)) / mask.sum()
 
         if self.training:
@@ -207,28 +212,34 @@ class PreTrainModel(pl.LightningModule):
             self.log("lr", lr, prog_bar=True, on_step=False, on_epoch=True, rank_zero_only=True)
         epi_loss = (epi_loss * (self.alpha ** 2)).sum()
 
-        loss = clsloss #+ epi_loss
+        loss = clsloss  # + epi_loss
+
         if self.use_energy:
             energy_loss = self.energy_loss_fct(cls_logits.squeeze(), counts.to(torch.float))
             if self.training:
-                self.log(f"energy_loss", energy_loss, on_step=False, on_epoch=True, prog_bar=True)
+                self.log("energy_loss", energy_loss, on_step=False, on_epoch=True, prog_bar=True)
             loss = loss + energy_loss
 
+        # ATAC regression: predict per-nucleotide ATAC signal at the center 23nt window
+        atac_loss = torch.tensor(0.0, device=loss.device)
+        if self.atac_head is not None and isinstance(atac, torch.Tensor) and atac.shape[-1] > 0:
+            # atac_logits: [B, 23, num_atac] — per-nt predictions from hidden states
+            # atac target: slice the center 23nt from the full window
+            atac_true = atac[:, center - 23//2 - 1:center + 23//2].to(atac_logits.dtype)
+            atac_loss = self.atac_loss_fn(atac_logits, atac_true)
+            loss = loss + self.atac_weight * atac_loss
 
-
-
-        
-        return loss, logits, epi_logits, y, mask, clsloss, epi_loss
+        return loss, logits, epi_logits, y, mask, clsloss, epi_loss, atac_loss
 
     
     def training_step(self, batch, batch_idx):
-        loss, logits, epi_logits, y, mask, clsloss, epiloss = self.general_step(batch)
+        loss, logits, epi_logits, y, mask, clsloss, epiloss, atac_loss = self.general_step(batch)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_cls_loss", clsloss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_epi_loss", epiloss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("epi_logits_var", epi_logits[mask].std() ,on_step=False, on_epoch=True,)
+        self.log("train_atac_loss", atac_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("epi_logits_var", epi_logits[mask].std(), on_step=False, on_epoch=True)
         preds = torch.softmax(logits, dim=-1)
-        # Update AUPRC metric
         self.train_auprc.update(preds[mask], y.int()[mask])
         return loss
 
@@ -283,6 +294,9 @@ def run_pretraining(config):
     windowsize = config["windowsize"]
     merge = config["merge"]
     model_type = config["model_type"]
+    atac_features = config.get("atac_features", [])
+    num_atac = len(atac_features)
+    atac_weight = config.get("atac_weight", 0.1)
 
     pl.seed_everything(seed,workers=True)
 
@@ -294,26 +308,27 @@ def run_pretraining(config):
         epi_features=epi_features,
         window_size=config["windowsize"],
         batch_size=config["batch_size"],
-        num_workers = 20,
+        num_workers=20,
         num_samples=1000000,
         norm_epi=True if config["num_epi"] else False,
         use_energy=config["use_energy"],
-        mode=epi_mode
-
+        mode=epi_mode,
+        atac_features=atac_features,
     )
     model = PreTrainModel(
-            context_layers=neighborhood_layers,
-            hidden_dim=hidden_dim,
-            num_epi=num_epi,
-            dropout=dropout,
-            lr=lr,
-            seed=seed,
-            windowsize=windowsize,
-            merge=merge,
-            epi_weights = epi_weights,
-            use_energy=config["use_energy"]
-
-        )
+        context_layers=neighborhood_layers,
+        hidden_dim=hidden_dim,
+        num_epi=num_epi,
+        dropout=dropout,
+        lr=lr,
+        seed=seed,
+        windowsize=windowsize,
+        merge=merge,
+        epi_weights=epi_weights,
+        use_energy=config["use_energy"],
+        num_atac=num_atac,
+        atac_weight=atac_weight,
+    )
 
     checkpoint_cb = ModelCheckpoint(
         monitor="train_loss", 
@@ -375,9 +390,10 @@ if __name__ == "__main__":
             "model_type": "crosscrispr",
             "use_energy": False,
             "bw_dir": ["AGTensorsCL:0000624", "AGTensorsEFO:0002067"],
-            "epi_mode": "np"
+            "epi_mode": "np",
+            "atac_features": ["ATAC"],
+            "atac_weight": 0.1,
             #"chkpt": "RUNlogs/PretrainingArtificial/test_split0/ctl6_bs512_ws512_ue20_seed0_hashe0e76e6bafdf121cbfc3/run_/vv6/checkpoints/best_model.ckpt"
-
         }
     else:
         import argparse
