@@ -848,24 +848,30 @@ class GenomicDataModule(pl.LightningDataModule):
         else:
             self.oversample = False
         if isinstance(bw_dir, str):
-    
             bw_dir = [bw_dir]
         self.bw_dirs = bw_dir
+        # atac_features must be set before bw_files so ATAC files are included in the copy list
+        self.atac_features = atac_features or []
 
         self.chromosomes = list(CHROMOSOME_SIZES.keys())
+        all_track_features = list(epi_features) + self.atac_features
         if self.mode == "bw":
             self.bw_files = [
-            os.path.join(bw_dir, f"{epi_feat}.bw") for epi_feat in epi_features for bw_dir in self.bw_dirs
+                os.path.join(bw_dir, f"{feat}.bw") for feat in all_track_features for bw_dir in self.bw_dirs
             ]
         elif self.mode == "np":
             self.bw_files = [
-                os.path.join(bw_dir, f"{epi_feat}_{chr}.npy") for epi_feat in epi_features for chr in self.chromosomes for bw_dir in self.bw_dirs if os.path.exists(os.path.join(bw_dir, f"{epi_feat}_{chr}.npy")) 
+                os.path.join(bw_dir, f"{feat}_{chr}.npy")
+                for feat in all_track_features
+                for chr in self.chromosomes
+                for bw_dir in self.bw_dirs
+                if os.path.exists(os.path.join(bw_dir, f"{feat}_{chr}.npy"))
             ]
             if len(epi_features):
                 assert len(self.bw_files), "Path probably wrong"
         else:
             raise ValueError("mode must be either bw (bigwig) or np (numpy)")
-        self.tmp_base = os.environ.get("TMPDIR", "/tmp") 
+        self.tmp_base = os.environ.get("TMPDIR", "/tmp")
         self.local_bw_dirs = [os.path.join(self.tmp_base, os.path.basename(bw_dir)) for bw_dir in self.bw_dirs]
         self.prepare_data_per_node = True
 
@@ -874,7 +880,6 @@ class GenomicDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.num_samples = num_samples
         self.norm_epi = norm_epi
-        self.atac_features = atac_features or []
     
     def _norm_eng(self):
         dataset = EnergyGenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, 10000)
