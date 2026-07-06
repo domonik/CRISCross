@@ -255,7 +255,7 @@ def estimate_energy_stats(loader):
     M2 = 0.0  # sum of squared differences from the mean
 
     for batch in loader:
-        _, _, _, _, energy, _ = batch  # energy: shape (B, ...) or (B,)
+        energy = batch[4]  # index-safe: works for 6- and 7-element batches
 
         energy = energy.view(-1).float()  # flatten batch
         batch_n = energy.numel()
@@ -278,7 +278,7 @@ def estimate_energy_stats(loader):
 def estimate_all_stats(loader):
     all_epi = []
     for idx, batch in enumerate(loader):
-        _, _, epi, _, _, _ = batch          # epi: (B, L, F)
+        epi = batch[2]          # index-safe: works for 6- and 7-element batches
         epi = epi.detach().cpu()
         all_epi.append(epi)
 
@@ -333,7 +333,7 @@ def estimate_stats(loader):
     feature_sq_sum = None
     count = 0
     for batch in loader:
-        _, _, epi, _, _ = batch  # epi: (B, L, F)
+        epi = batch[2]  # index-safe: works for 5-, 6-, and 7-element batches
 
         # move to CPU if needed
         epi = epi.detach().cpu()

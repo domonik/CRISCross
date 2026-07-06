@@ -114,7 +114,8 @@ class PreTrainModel(pl.LightningModule):
     def forward(self, target_x, off_target_x, epi, strands):
         cls_logits, hidden = self.model(target_x, off_target_x, strands, epi)
         epi_logits = self.per_nt_epi_head(hidden)
-        atac_logits = self.atac_head(hidden) if self.atac_head is not None else None
+        # Mean-pool per-nt hidden states → [B, hidden_dim] → [B, num_atac] scalar prediction
+        atac_logits = self.atac_head(hidden.mean(dim=1)) if self.atac_head is not None else None
         logits = self.per_nt_classifier(hidden)
         return logits, epi_logits, cls_logits, atac_logits
     
@@ -220,12 +221,12 @@ class PreTrainModel(pl.LightningModule):
                 self.log("energy_loss", energy_loss, on_step=False, on_epoch=True, prog_bar=True)
             loss = loss + energy_loss
 
-        # ATAC regression: predict per-nucleotide ATAC signal at the center 23nt window
+        # ATAC regression: predict mean ATAC signal over the center 23nt protospacer
+        # atac_logits: [B, num_atac] — from mean-pooled hidden states (Option A)
+        # atac_true:   [B, num_atac] — mean of the 23 per-nucleotide ATAC values
         atac_loss = torch.tensor(0.0, device=loss.device)
         if self.atac_head is not None and isinstance(atac, torch.Tensor) and atac.shape[-1] > 0:
-            # atac_logits: [B, 23, num_atac] — per-nt predictions from hidden states
-            # atac target: slice the center 23nt from the full window
-            atac_true = atac[:, center - 23//2 - 1:center + 23//2].to(atac_logits.dtype)
+            atac_true = atac[:, center - 23//2 - 1:center + 23//2].mean(dim=1).to(atac_logits.dtype)
             atac_loss = self.atac_loss_fn(atac_logits, atac_true)
             loss = loss + self.atac_weight * atac_loss
 
@@ -366,10 +367,20 @@ if __name__ == "__main__":
     #    config = json.load(handle)
     idx = os.environ.get("SLURM_ARRAY_TASK_ID", None)
     if idx is None:
-        epi_features = [            
-            "H3K4me1",  
-            "H3K4me3",  
+        epi_features = [
+            "EX_H3K4me1",
+            "EX_H3K4me3",
+            "EX_H3K9ac",
+            "EX_H3K9me3",
+            "EX_H3K27ac",
+            "EX_H3K27me3",
+            "EX_H3K36me3",
+            "H3K27ac",
+            "H3K27me3",
             "H3K36me3",
+            "H3K4me1",
+            "H3K4me3",
+            "H3K9me3",
         ]
         #epi_features = []
         params = {
