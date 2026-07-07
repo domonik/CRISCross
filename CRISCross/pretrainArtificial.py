@@ -36,16 +36,18 @@ def short_hash(epi_features, length=6):
     return h[:length]
 
 def get_logger(config):
-    epi_hash = short_hash(config["epi_features"], config["num_epi"])
-    base_dir = f"RUNlogs/{config['experiment']}/test_split{config['split']}/ctl{config['context_layers']}_bs{config['batch_size']}_ws{config["windowsize"]}_ue{config['num_epi']}_seed{config['seed']}_energy{config["use_energy"]}_hash{epi_hash}" 
-    existing = os.listdir(os.path.join(base_dir, "run_")) if os.path.exists(base_dir) else []
-    print(f"BASE DIR: {base_dir}")
+    epi_hash = short_hash(config["epi_features"])
+    base_dir = f"RUNlogs/{config['experiment']}/test_split{config['split']}/ctl{config['context_layers']}_bs{config['batch_size']}_ws{config['windowsize']}_ue{config['num_epi']}_seed{config['seed']}_energy{config['use_energy']}_hash{epi_hash}"
+    run_dir = os.path.join(base_dir, "run_")
+    existing = os.listdir(run_dir) if os.path.exists(run_dir) else []
     version = f"v{len(existing)}"
+    print(f"[LOGGER] BASE DIR: {base_dir}")
+    print(f"[LOGGER] Found {len(existing)} existing run(s) in {run_dir}, using version={version}")
     logger = TensorBoardLogger(
         save_dir=base_dir,   # your custom folder
-        name=f"run_",
-        version=f"v{version}"
-    )   
+        name="run_",
+        version=version,
+    )
     return logger
 
 class PreTrainModel(pl.LightningModule):
@@ -222,7 +224,7 @@ class PreTrainModel(pl.LightningModule):
             loss = loss + energy_loss
 
         # ATAC regression: predict mean ATAC signal over the center 23nt protospacer
-        # atac_logits: [B, num_atac] — from mean-pooled hidden states (Option A)
+        # atac_logits: [B, num_atac] — from mean-pooled hidden states 
         # atac_true:   [B, num_atac] — mean of the 23 per-nucleotide ATAC values
         atac_loss = torch.tensor(0.0, device=loss.device)
         if self.atac_head is not None and isinstance(atac, torch.Tensor) and atac.shape[-1] > 0:
@@ -235,6 +237,15 @@ class PreTrainModel(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         loss, logits, epi_logits, y, mask, clsloss, epiloss, atac_loss = self.general_step(batch)
+        if self.current_epoch == 0 and batch_idx == 0:
+            print(
+                f"[TRAIN] first batch ran successfully -> "
+                f"loss={loss.item():.4f} cls_loss={clsloss.item():.4f} "
+                f"epi_loss={epiloss.item():.4f} atac_loss={atac_loss.item():.4f} "
+                f"masked_frac={mask.float().mean().item():.3f}"
+            )
+            if torch.isnan(loss):
+                print("[WARNING] loss is NaN on the very first batch — check data/model setup!")
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_cls_loss", clsloss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_epi_loss", epiloss, on_step=False, on_epoch=True, prog_bar=True)
@@ -299,10 +310,16 @@ def run_pretraining(config):
     num_atac = len(atac_features)
     atac_weight = config.get("atac_weight", 0.1)
 
+    print(f"[CONFIG] batch_size={batch_size}, windowsize={windowsize}, seed={seed}, lr={lr}")
+    print(f"[CONFIG] epi_features ({len(epi_features)}): {epi_features}")
+    print(f"[CONFIG] num_epi={num_epi}, atac_features={atac_features}, num_atac={num_atac}")
+    print(f"[ENV] CUDA available: {torch.cuda.is_available()}, device_count: {torch.cuda.device_count()}")
+
     pl.seed_everything(seed,workers=True)
 
     bw_dir = "EX_BigWigs" if "bw_dir" not in config else config["bw_dir"]
     epi_mode = "bw" if "epi_mode" not in config else config["epi_mode"]
+    print(f"[DATA] Building GenomicDataModule (bw_dir={bw_dir}, mode={epi_mode})...")
     dm = GenomicDataModule(
         fasta_path="GRCh38.primary_assembly.genome.fa",
         bw_dir=bw_dir,
@@ -330,6 +347,7 @@ def run_pretraining(config):
         num_atac=num_atac,
         atac_weight=atac_weight,
     )
+    print(f"[MODEL] Built PreTrainModel with {model.hparams.n_trainable_params:,} trainable parameters")
 
     checkpoint_cb = ModelCheckpoint(
         monitor="train_loss", 
@@ -345,7 +363,7 @@ def run_pretraining(config):
     trainer = pl.Trainer(
         max_steps=15000,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=torch.cuda.device_count(),
+        devices=torch.cuda.device_count() if torch.cuda.is_available() else 1,
         callbacks=[checkpoint_cb, earlystop_cb],
         log_every_n_steps=10,
         logger=logger,
@@ -355,7 +373,9 @@ def run_pretraining(config):
         precision="bf16-mixed",
         strategy=DDPStrategy(find_unused_parameters=True),
             )
+    print("[TRAIN] Starting trainer.fit() ...")
     trainer.fit(model, dm, ckpt_path=config["chkpt"] if "chkpt" in config else None)
+    print("[TRAIN] trainer.fit() finished.")
 
 
 
@@ -384,7 +404,7 @@ if __name__ == "__main__":
         ]
         #epi_features = []
         params = {
-            "batch_size": 1024,
+            "batch_size": 1,  # TODO: bump back up (e.g. 1024) once the sanity-check run passes
             "context_layers": 3,
             "hidden_dim": 512,
             "embed_size": 32,

@@ -1093,6 +1093,18 @@ class GenomicDataModule(pl.LightningDataModule):
                 **kwargs
             )
 
+        train_len = len(self.dataset)
+        val_len = len(self.val_set)
+        print(
+            f"[DATA] setup() complete -> train samples: {train_len}, val samples: {val_len}, "
+            f"epi_features: {self.epi_features}, atac_features: {self.atac_features}"
+        )
+        if train_len == 0:
+            raise RuntimeError(
+                "GenomicDataModule.setup(): training dataset is empty (0 samples). "
+                "Check num_samples, bw_dir paths, and fasta_path in the config."
+            )
+
     def train_dataloader(self):
        
         if self.oversample:
