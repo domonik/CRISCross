@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH --job-name=criscross_pretrain_test
 #SBATCH --partition=gpu-single
 #SBATCH --gres=gpu:1
@@ -17,9 +16,11 @@ set -euo pipefail
 # falls into its hardcoded default `params` dict (batch_size=1) and prints
 # the [CONFIG]/[DATA]/[MODEL]/[TRAIN] sanity messages as it loads/trains.
 
+set -euo pipefail
+
 source /home/fr/fr_fr/fr_js2142/miniforge3/etc/profile.d/conda.sh
 conda activate myenv
 
-cd /gpfs/bwfor/work/ws/fr_js2142-minex/CRISCross || { echo "ERROR: could not cd to CRISCross directory"; exit 1; }
+cd /gpfs/bwfor/work/ws/fr_js2142-minex/pretrain_cris/CRISCross || { echo "ERROR: could not cd to CRISCross directory"; exit 1; }
 
 srun python -m CRISCross.pretrainArtificial
