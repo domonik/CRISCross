@@ -321,7 +321,7 @@ def run_pretraining(config):
     epi_mode = "bw" if "epi_mode" not in config else config["epi_mode"]
     print(f"[DATA] Building GenomicDataModule (bw_dir={bw_dir}, mode={epi_mode})...")
     dm = GenomicDataModule(
-        fasta_path="GRCh38.primary_assembly.genome.fa",
+        fasta_path="data/GRCh38.primary_assembly.genome.fa",
         bw_dir=bw_dir,
         epi_features=epi_features,
         window_size=config["windowsize"],
