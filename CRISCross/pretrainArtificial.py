@@ -416,7 +416,10 @@ if __name__ == "__main__":
             "merge": None,
             "model_type": "crosscrispr",
             "use_energy": False,
-            "bw_dir": ["AGTensorsCL:0000624", "AGTensorsEFO:0002067"],
+            # TODO: add "AGTensorsEFO:0002067" back once it's downloaded and the "EX_"-prefixed
+            # epi_features above are restored -- it's omitted for now since Datasets.py's
+            # prepare_data() requires every epi_feature to exist in every listed bw_dir.
+            "bw_dir": ["AGTensorsCL:0000624"],
             "epi_mode": "np",
             "atac_features": ["ATAC"],
             "atac_weight": 0.1,
