@@ -387,14 +387,10 @@ if __name__ == "__main__":
     #    config = json.load(handle)
     idx = os.environ.get("SLURM_ARRAY_TASK_ID", None)
     if idx is None:
+        # TODO: restore the 7 "EX_"-prefixed features once AGTensorsEFO:0002067 is downloaded.
+        # Trimmed to just what's been fully downloaded so far under AGTensorsCL:0000624
+        # (ATAC + CHIP_HISTONE) so the batch_size=1 sanity check can run today.
         epi_features = [
-            "EX_H3K4me1",
-            "EX_H3K4me3",
-            "EX_H3K9ac",
-            "EX_H3K9me3",
-            "EX_H3K27ac",
-            "EX_H3K27me3",
-            "EX_H3K36me3",
             "H3K27ac",
             "H3K27me3",
             "H3K36me3",
