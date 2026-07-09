@@ -832,7 +832,7 @@ CHROMOSOME_SIZES = {
 
 
 class GenomicDataModule(pl.LightningDataModule):
-    def __init__(self, fasta_path, epi_features, bw_dir, window_size=512, batch_size=32, num_workers=4, num_samples=10000, norm_epi=False, use_energy=False, mode="np", df=None, val_guides=None, test_guides=None, atac_features=None):
+    def __init__(self, fasta_path, epi_features, bw_dir, window_size=512, batch_size=32, num_workers=4, num_samples=10000, norm_epi=False, use_energy=False, mode="np", df=None, val_guides=None, test_guides=None, atac_features=None, norm_num_samples=10000):
         super().__init__()
         self.chrom_sizes = None
         self.seq_dict = None
@@ -880,16 +880,17 @@ class GenomicDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.num_samples = num_samples
         self.norm_epi = norm_epi
-    
+        self.norm_num_samples = norm_num_samples
+
     def _norm_eng(self):
-        dataset = EnergyGenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, 10000)
+        dataset = EnergyGenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, self.norm_num_samples)
         dl = DataLoader(dataset, sampler= None, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=False)
         stats = estimate_energy_stats(dl)
         return stats
 
     
     def _norm_epi(self):
-        dataset = GenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, 10000)
+        dataset = GenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, self.norm_num_samples)
         dl = DataLoader(dataset, sampler=None, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=False)
         stats = estimate_all_stats(dl)
         return stats
@@ -901,7 +902,7 @@ class GenomicDataModule(pl.LightningDataModule):
             self.chrom_sizes, self.seq_dict, self.local_bw_dirs,
             epi_features=[],
             window_size=self.window_size,
-            num_samples=10000,
+            num_samples=self.norm_num_samples,
             atac_features=self.atac_features,
             atac_stats=None,  # no normalisation yet — collect raw log1p values
         )

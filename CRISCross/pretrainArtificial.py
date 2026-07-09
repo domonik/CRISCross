@@ -320,18 +320,21 @@ def run_pretraining(config):
     bw_dir = "EX_BigWigs" if "bw_dir" not in config else config["bw_dir"]
     epi_mode = "bw" if "epi_mode" not in config else config["epi_mode"]
     print(f"[DATA] Building GenomicDataModule (bw_dir={bw_dir}, mode={epi_mode})...")
+    num_workers = config.get("num_workers", 20)
+    norm_num_samples = config.get("norm_num_samples", 10000)
     dm = GenomicDataModule(
         fasta_path="data/GRCh38.primary_assembly.genome.fa",
         bw_dir=bw_dir,
         epi_features=epi_features,
         window_size=config["windowsize"],
         batch_size=config["batch_size"],
-        num_workers=20,
+        num_workers=num_workers,
         num_samples=1000000,
         norm_epi=True if config["num_epi"] else False,
         use_energy=config["use_energy"],
         mode=epi_mode,
         atac_features=atac_features,
+        norm_num_samples=norm_num_samples,
     )
     model = PreTrainModel(
         context_layers=neighborhood_layers,
@@ -359,21 +362,23 @@ def run_pretraining(config):
 
     logger = get_logger(config=config)
 
+    max_steps = config.get("max_steps", 15000)
+    accumulate_grad_batches = config.get("accumulate_grad_batches", 25)
     earlystop_cb = EarlyStopping(monitor="train_loss", mode="min", patience=patience)
     trainer = pl.Trainer(
-        max_steps=15000,
+        max_steps=max_steps,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=torch.cuda.device_count() if torch.cuda.is_available() else 1,
         callbacks=[checkpoint_cb, earlystop_cb],
         log_every_n_steps=10,
         logger=logger,
         deterministic=True,
-        accumulate_grad_batches=25,
+        accumulate_grad_batches=accumulate_grad_batches,
         gradient_clip_val=0.5,
         precision="bf16-mixed",
         strategy=DDPStrategy(find_unused_parameters=True),
             )
-    print("[TRAIN] Starting trainer.fit() ...")
+    print(f"[TRAIN] Starting trainer.fit() ... (max_steps={max_steps}, accumulate_grad_batches={accumulate_grad_batches}, num_workers={num_workers})")
     trainer.fit(model, dm, ckpt_path=config["chkpt"] if "chkpt" in config else None)
     print("[TRAIN] trainer.fit() finished.")
 
@@ -400,7 +405,7 @@ if __name__ == "__main__":
         ]
         #epi_features = []
         params = {
-            "batch_size": 1,  # TODO: bump back up (e.g. 1024) once the sanity-check run passes
+            "batch_size": 1024,
             "context_layers": 3,
             "hidden_dim": 512,
             "embed_size": 32,
@@ -423,6 +428,12 @@ if __name__ == "__main__":
             "epi_mode": "np",
             "atac_features": ["ATAC"],
             "atac_weight": 0.1,
+            # num_workers, norm_num_samples, max_steps intentionally omitted here --
+            # they fall back to production defaults (20, 10000, 15000).
+            # accumulate_grad_batches halved from the 1-GPU default (25 -> 12) because this
+            # run uses 2 GPUs: effective batch/step = batch_size * num_gpus * accumulate_grad_batches
+            # = 1024 * 2 * 12 = 24,576, close to the original single-GPU 1024*1*25 = 25,600.
+            "accumulate_grad_batches": 12,
             #"chkpt": "RUNlogs/PretrainingArtificial/test_split0/ctl6_bs512_ws512_ue20_seed0_hashe0e76e6bafdf121cbfc3/run_/vv6/checkpoints/best_model.ckpt"
         }
     else:
