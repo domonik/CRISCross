@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=criscross_pretrain_full
 #SBATCH --partition=gpu-single
-#SBATCH --gres=gpu:h200:2             # verify exact GRES string with: sinfo -p gpu-single -o "%N %G" | grep -i h200
+#SBATCH --gres=gpu:2             # verify exact GRES string with: sinfo -p gpu-single -o "%N %G" | grep -i h200
 #SBATCH --cpus-per-task=48            # ~24 per GPU-rank: 2 DDP ranks x num_workers=20 each = 40 worker procs
 #SBATCH --mem=128G
-#SBATCH --time=48:00:00               # adjust based on how long the smoke test's per-step timing suggests
+#SBATCH --time=5-00:00:00
 #SBATCH --output=logs/slurm/pretrain_full_%j.out
 #SBATCH --error=logs/slurm/pretrain_full_%j.err
 
@@ -24,6 +24,6 @@ set -euo pipefail
 source /home/fr/fr_fr/fr_js2142/miniforge3/etc/profile.d/conda.sh
 conda activate myenv
 
-cd /gpfs/bwfor/work/ws/fr_js2142-minex/pretrain_cris/CRISCross || { echo "ERROR: could not cd to CRISCross directory"; exit 1; }
+cd /gpfs/bwfor/work/ws/fr_js2142-minex/pretrain_final/CRISCross || { echo "ERROR: could not cd to CRISCross directory"; exit 1; }
 
 srun python -m CRISCross.pretrainArtificial

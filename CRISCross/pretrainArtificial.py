@@ -313,7 +313,11 @@ def run_pretraining(config):
     print(f"[CONFIG] batch_size={batch_size}, windowsize={windowsize}, seed={seed}, lr={lr}")
     print(f"[CONFIG] epi_features ({len(epi_features)}): {epi_features}")
     print(f"[CONFIG] num_epi={num_epi}, atac_features={atac_features}, num_atac={num_atac}")
-    print(f"[ENV] CUDA available: {torch.cuda.is_available()}, device_count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+        print(f"[ENV] CUDA available: True, device_count: {torch.cuda.device_count()}, gpus: {gpu_names}")
+    else:
+        print("[ENV] CUDA available: False")
 
     pl.seed_everything(seed,workers=True)
 
@@ -417,7 +421,7 @@ if __name__ == "__main__":
             "split": 1,
             "experiment": "PretrainingArtificialTest",
             "regression": False,
-            "windowsize": 23,
+            "windowsize": 512,
             "merge": None,
             "model_type": "crosscrispr",
             "use_energy": False,
