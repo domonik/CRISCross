@@ -698,7 +698,7 @@ class FineTuningGenomicDataset(Dataset):
         center = self.centers[idx]
 
  
-        start = center - self.window_size // 2
+        start = center - self.window_size // 2 - (self.window_size % 2)
         end = center + self.window_size // 2
         off_target_x = self.seq_dict[chrom][start:end]
         target_x = self.targets[idx]
