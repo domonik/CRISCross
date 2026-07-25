@@ -778,3 +778,58 @@ class CRISCross(nn.Module):
                 )
 
         return self.out_proj(x[:, 0]), x[:, 1:]
+
+
+def get_lora_config(r: int = 8, alpha: int = 16, dropout: float = 0.1):
+    """Return a LoraConfig targeting the linear layers of CRISCross attention and MLP blocks.
+
+    nn.MultiheadAttention stores the q/k/v projections as a fused in_proj_weight parameter
+    (not as nn.Linear submodules), so PEFT cannot wrap them directly. We target the next
+    best set: the attention output projection (out_proj) and both MLP linear layers (mlp.0,
+    mlp.3) in every SelfAttentionLayer and CrossAttentionLayer.
+
+    Args:
+        r: LoRA rank. Lower values mean fewer trainable parameters. Default: 8.
+        alpha: LoRA scaling factor (effective scale = alpha / r). Default: 16.
+        dropout: Dropout applied to the LoRA adapter path. Default: 0.1.
+
+    Returns:
+        peft.LoraConfig configured for CRISCross.
+    """
+    from peft import LoraConfig
+    return LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        # Use fully-qualified suffixes to avoid matching CRISCross.out_proj (a Sequential).
+        # "out_proj" alone would match that Sequential and crash; these only match the
+        # nn.Linear out_proj inside nn.MultiheadAttention (self_attn / cross_attn).
+        target_modules=["self_attn.out_proj", "cross_attn.out_proj", "mlp.0", "mlp.3"],
+        lora_dropout=dropout,
+        bias="none",
+    )
+
+
+def freeze_base_model(model: nn.Module) -> None:
+    """Freeze all parameters that are not part of a LoRA adapter.
+
+    After calling get_peft_model(), this freezes every parameter whose name does
+    not contain "lora", leaving only the LoRA adapter weights trainable.
+
+    Args:
+        model: The PEFT-wrapped model (returned by get_peft_model).
+    """
+    for name, param in model.named_parameters():
+        if "lora" not in name:
+            param.requires_grad = False
+
+
+def unfreeze_all(model: nn.Module) -> None:
+    """Unfreeze all model parameters (for full fine-tuning).
+
+    Args:
+        model: Any nn.Module.
+    """
+    for param in model.parameters():
+        param.requires_grad = True
+
+

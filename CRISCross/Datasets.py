@@ -725,7 +725,7 @@ class FineTuningGenomicDataset(Dataset):
                 epi[:, self.epi_log_mask] = torch.log1p(epi[:, self.epi_log_mask])
                 epi = (epi - self.epi_mean) / self.epi_std
             if not strand:
-                epi = epi.flip(-1)
+                epi = epi.flip(0)  # flip spatial dimension for reverse complement
         else:
             epi = 0
         counts = 0
