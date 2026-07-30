@@ -409,7 +409,7 @@ if __name__ == "__main__":
         ]
         #epi_features = []
         params = {
-            "batch_size": 1024,
+            "batch_size": 256,
             "context_layers": 3,
             "hidden_dim": 512,
             "embed_size": 32,
@@ -437,7 +437,7 @@ if __name__ == "__main__":
             # accumulate_grad_batches halved from the 1-GPU default (25 -> 12) because this
             # run uses 2 GPUs: effective batch/step = batch_size * num_gpus * accumulate_grad_batches
             # = 1024 * 2 * 12 = 24,576, close to the original single-GPU 1024*1*25 = 25,600.
-            "accumulate_grad_batches": 12,
+            "accumulate_grad_batches": 48,
             #"chkpt": "RUNlogs/PretrainingArtificial/test_split0/ctl6_bs512_ws512_ue20_seed0_hashe0e76e6bafdf121cbfc3/run_/vv6/checkpoints/best_model.ckpt"
         }
     else:

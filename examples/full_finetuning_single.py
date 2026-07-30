@@ -1,12 +1,14 @@
 import argparse
 import csv
 import os
+from datetime import datetime
 
 import pandas as pd
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 from torchmetrics.classification import BinaryAveragePrecision
 
 from CRISCross.Datasets import GenomicDataModule
@@ -164,12 +166,20 @@ if __name__ == "__main__":
         verbose=True,
     )
 
+    run_version = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tb_logger = TensorBoardLogger(
+        save_dir="logs",
+        name=f"full_sanity_{TEST_GUIDE}",
+        version=f"seed_{seed}_{run_version}",
+    )
+
     trainer = pl.Trainer(
         default_root_dir=f"checkpoints_full_sanity/{TEST_GUIDE}/seed_{seed}",
         max_epochs=200,
         accelerator=args.accelerator,
         precision=precision,
         callbacks=[checkpoint_callback, early_stop_callback],
+        logger=tb_logger,
     )
     trainer.fit(lightning_model, datamodule)
 

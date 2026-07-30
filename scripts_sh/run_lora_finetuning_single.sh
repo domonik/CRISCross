@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=lora_single_sanity
-#SBATCH --partition=devel
+#SBATCH --partition=gpu-single
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
