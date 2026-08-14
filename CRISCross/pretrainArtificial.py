@@ -422,7 +422,7 @@ if __name__ == "__main__":
             "experiment": "PretrainingArtificialTest",
             "regression": False,
             "windowsize": 512,
-            "merge": None,
+            "merge": "early",
             "model_type": "crosscrispr",
             "use_energy": False,
             # TODO: add "AGTensorsEFO:0002067" back once it's downloaded and the "EX_"-prefixed

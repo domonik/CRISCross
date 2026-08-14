@@ -41,7 +41,7 @@ def load_criscross_with_lora(ckpt_path: str, lora_r: int = 8, lora_alpha: int = 
         "num_epi": ptm.hparams.num_epi,
         "output_size": 1,
         "windowsize": ptm.hparams.windowsize,
-        "merge": ptm.hparams.merge,
+        "merge": "early",
     }
     model = CRISCross(**cfg)
     model.load_state_dict(ptm.model.state_dict())
@@ -102,7 +102,7 @@ if __name__ == "__main__":
         type=str,
         default=(
             "RUNlogs/PretrainingArtificialTest/test_split1/"
-            "ctl3_bs1024_ws23_ue6_seed0_energyFalse_hash7511e7/"
+            "ctl3_bs256_ws512_ue6_seed0_energyFalse_hash7511e7/"
             "run_/v0/checkpoints/best_model.ckpt"
         ),
         help=(

@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=2:00:00            # 10 seeds run sequentially, up to 200 epochs each with early stopping
+#SBATCH --time=4:00:00            # 10 seeds run sequentially, up to 200 epochs each with early stopping
 #SBATCH --output=logs/slurm/full_multiseed_%A_%a.out
 #SBATCH --error=logs/slurm/full_multiseed_%A_%a.err
 
