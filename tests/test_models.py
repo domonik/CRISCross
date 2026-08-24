@@ -20,6 +20,7 @@ from CRISCross.models import (
     StrandEmbedding,
     CRISCross,
 )
+from CRISCross.bulges import band_bounds, band_width
 
 
 # ============================================================================
@@ -125,9 +126,9 @@ class TestHighlightCenterAndPAM:
         batch_size = 2
         seq_len = 512
         x = torch.randn(batch_size, seq_len, d_model, device=cpu_device)
-        center = 256
+        start, end = band_bounds(seq_len)
 
-        output = module(x, center)
+        output = module(x, start, end)
 
         # Output should have same shape as input
         assert output.shape == x.shape
@@ -135,7 +136,7 @@ class TestHighlightCenterAndPAM:
         assert not torch.equal(output, x)
 
     def test_correct_region_masking(self, cpu_device):
-        """Test that center 23nt and last 3nt are correctly marked."""
+        """Test that the band and its trailing 3nt PAM are correctly marked."""
         d_model = 32
         module = HighlightCenterAndPAM(d_model=d_model, n_types=3)
         module = module.to(cpu_device)
@@ -143,20 +144,39 @@ class TestHighlightCenterAndPAM:
         batch_size = 1
         seq_len = 512
         x = torch.zeros(batch_size, seq_len, d_model, device=cpu_device)
-        center = 256
+        start, end = band_bounds(seq_len)
 
-        output = module(x, center)
+        output = module(x, start, end)
 
-        # The embedding should be added to specific regions
-        # Check that center region (23nt around center) has non-zero values
-        start = center - 23 // 2 - 1
-        end = center + 23 // 2
-        center_region = output[:, start:end, :]
-        assert center_region.abs().sum() > 0
+        band = module.token_type_emb.weight[1]
+        pam = module.token_type_emb.weight[2]
+        background = module.token_type_emb.weight[0]
 
-        # Check that PAM region (last 3nt) has non-zero values
-        pam_region = output[:, seq_len - 3:seq_len, :]
-        assert pam_region.abs().sum() > 0
+        assert torch.allclose(output[0, start], band)
+        assert torch.allclose(output[0, end - 4], band)
+        assert torch.allclose(output[0, end - 3], pam)
+        assert torch.allclose(output[0, end - 1], pam)
+        assert torch.allclose(output[0, end], background)
+        assert torch.allclose(output[0, start - 1], background)
+
+    def test_region_label_is_fixed_width(self, cpu_device):
+        """The labelled extent must not depend on anything sample-specific.
+
+        A region label that tracked the true 19/20/21-nt protospacer extent
+        would hand the model the bulge configuration (spec section 6.2).
+        """
+        d_model = 16
+        module = HighlightCenterAndPAM(d_model=d_model, n_types=3).to(cpu_device)
+        seq_len = 512
+
+        for delta in [0, 1, 2, 3]:
+            start, end = band_bounds(seq_len, delta)
+            x = torch.zeros(1, seq_len, d_model, device=cpu_device)
+            output = module(x, start, end)
+            labelled = (
+                ~torch.isclose(output[0], module.token_type_emb.weight[0]).all(-1)
+            ).sum()
+            assert int(labelled) == band_width(delta)
 
     def test_multiple_batch_elements(self, cpu_device):
         """Test with multiple batch elements."""
@@ -167,22 +187,22 @@ class TestHighlightCenterAndPAM:
         batch_size = 4
         seq_len = 256
         x = torch.randn(batch_size, seq_len, d_model, device=cpu_device)
-        center = 128
+        start, end = band_bounds(seq_len)
 
-        output = module(x, center)
+        output = module(x, start, end)
 
         assert output.shape == (batch_size, seq_len, d_model)
 
-    def test_different_center_positions(self, cpu_device):
-        """Test with different center positions."""
+    def test_different_band_positions(self, cpu_device):
+        """Test with different band placements."""
         d_model = 32
         module = HighlightCenterAndPAM(d_model=d_model, n_types=3)
         module = module.to(cpu_device)
 
         x = torch.randn(1, 100, d_model, device=cpu_device)
 
-        for center in [20, 50, 80]:
-            output = module(x.clone(), center)
+        for start in [10, 40, 70]:
+            output = module(x.clone(), start, start + 23)
             assert output.shape == x.shape
 
 
@@ -775,6 +795,54 @@ class TestCRISCross:
         # Sigmoid output should be in [0, 1]
         assert (probs >= 0).all()
         assert (probs <= 1).all()
+
+    def test_default_band_matches_the_legacy_slice(self, cpu_device):
+        """band_delta=0 must reproduce the original centred 23-nt band exactly."""
+        for windowsize in [64, 128, 256, 512, 511]:
+            config = self._get_minimal_config()
+            config["windowsize"] = windowsize
+            model = CRISCross(**config)
+            center = windowsize // 2 + windowsize % 2
+            assert model.band_start == center - 23 // 2 - 1
+            assert model.band_end == center + 23 // 2
+            assert model.band_width == 23
+
+    def test_widened_band_stays_pam_anchored(self, cpu_device):
+        """Extra width is added PAM-distally; the PAM end never moves."""
+        config = self._get_minimal_config()
+        base = CRISCross(**config)
+        for delta in [1, 2, 3]:
+            config = self._get_minimal_config()
+            config["band_delta"] = delta
+            model = CRISCross(**config)
+            assert model.band_end == base.band_end
+            assert model.band_width == 23 + 2 * delta
+            assert model.band_start == base.band_start - 2 * delta
+
+    def test_forward_pass_with_widened_band(self, cpu_device):
+        """A wider band must not change any tensor shape the caller sees."""
+        for delta in [0, 1, 2, 3]:
+            config = self._get_minimal_config()
+            config["band_delta"] = delta
+            model = CRISCross(**config).to(cpu_device)
+            model.eval()
+
+            target = torch.randint(0, 5, (2, 23), device=cpu_device)
+            off_target = torch.randint(0, 5, (2, 128), device=cpu_device)
+            strand = torch.tensor([0, 1], device=cpu_device)
+
+            with torch.no_grad():
+                cls_logits, outputs = model(target, off_target, strand, epi=None)
+
+            assert cls_logits.shape == (2, 1)
+            assert outputs.shape == (2, 23, config["hidden_dim"])
+
+    def test_band_must_fit_in_the_window(self, cpu_device):
+        config = self._get_minimal_config()
+        config["windowsize"] = 24
+        config["band_delta"] = 3
+        with pytest.raises(ValueError, match="does not fit"):
+            CRISCross(**config)
 
     def test_multiple_output_sizes(self, cpu_device):
         """Test with different output sizes."""

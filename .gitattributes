@@ -1,0 +1,10 @@
+# The CRISPRoff energy tables are a protocol-0 pickle. With core.autocrlf=true
+# (the Windows default) git rewrites its LF bytes to CRLF on checkout, which
+# corrupts it: `pickle.load` then fails with
+# "the STRING opcode argument must be quoted". Force binary handling.
+*.pkl binary
+*.np binary
+*.npy binary
+*.bw binary
+*.fa binary
+*.gz binary

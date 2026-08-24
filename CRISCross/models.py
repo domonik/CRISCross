@@ -11,6 +11,8 @@ import torch
 import math
 from typing import Optional, Tuple
 
+from CRISCross.bulges import PAM_LEN, SITE_LEN, band_bounds, band_width
+
 
 def torch_convolve_int(tokens: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     """
@@ -250,28 +252,35 @@ class HighlightCenterAndPAM(nn.Module):
 
     CRISPR Cas9 targeting has critical regions that deserve special attention from
     the model:
-    - Center region (23nt around middle): PAM-proximal region where mismatches
-      have strongest impact on binding affinity
-    - PAM sequence (last 3nt): Protospacer Adjacent Motif required for Cas9 binding
+    - R-loop band: the PAM-proximal region where mismatches have the strongest
+      impact on binding affinity
+    - PAM sequence (last 3nt of the band): Protospacer Adjacent Motif required
+      for Cas9 binding
 
     This module adds learnable token-type embeddings based on biological significance:
-    - type=0: Background (no special embedding added)
-    - type=1: Center 23nt PAM-proximal region
-    - type=2: Last 3nt PAM sequence
+    - type=0: Background (flanking genomic context)
+    - type=1: The R-loop band
+    - type=2: The 3nt PAM at the PAM-proximal end of the band
 
     The model can learn to attend more carefully to these critical regions.
+
+    **The band must be identical for every sample.** The region label marks the
+    protospacer extent, so if it tracked the true 19/20/21-nt extent of a bulged
+    sample it would hand the model the bulge configuration it is supposed to
+    infer. The band bounds therefore come from the fixed, PAM-anchored geometry
+    in :mod:`CRISCross.bulges` and never from the sample.
 
     Example:
         >>> module = HighlightCenterAndPAM(d_model=512, n_types=3)
         >>> x = torch.randn(32, 512, 512)  # batch=32, seq_len=512, d_model=512
-        >>> output = module(x, center=256)
+        >>> output = module(x, 244, 267)
         >>> output.shape
         torch.Size([32, 512, 512])
 
     Args:
         d_model: Dimension of the model/embedding. Determines size of token-type
             embeddings. Should match the embedding dimension of input tensors.
-        n_types: Number of distinct token types. Default: 3 (background=0, center=1,
+        n_types: Number of distinct token types. Default: 3 (background=0, band=1,
             PAM=2). Must be at least 3 to cover all regions.
 
     Attributes:
@@ -288,41 +297,35 @@ class HighlightCenterAndPAM(nn.Module):
         super().__init__()
         self.token_type_emb = nn.Embedding(n_types, d_model)
 
-    def forward(self, x: torch.Tensor, center: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, band_start: int, band_end: int) -> torch.Tensor:
         """Apply token-type embeddings based on biological significance.
 
         Creates a mask marking:
-        - Center 23nt region (PAM-proximal): type=1
-        - Last 3nt (PAM sequence): type=2
-        - Rest of sequence: type=0 (background, no embedding added)
-
-        The center parameter determines the middle position from which the 23nt
-        PAM-proximal region is centered. The PAM (last 3nt) is always at the end
-        of the sequence.
+        - The band [band_start, band_end): type=1
+        - The final 3nt of the band (PAM sequence): type=2
+        - Rest of sequence: type=0 (background)
 
         Example:
             >>> module = HighlightCenterAndPAM(d_model=512)
             >>> x = torch.randn(4, 512, 512)
-            >>> output = module(x, center=256)  # Center at position 256
-            # Positions 245-267 get type=1 (center), 509-512 get type=2 (PAM)
+            >>> output = module(x, 244, 267)
+            # Positions 244-266 get type=1, 264-266 get type=2
 
         Args:
             x: Input tensor of shape [batch, seq_len, d_model]. Embeddings to which
                 type embeddings will be added.
-            center: Center index for the 23nt PAM-proximal region. The region spans
-                from (center - 12) to (center + 11), covering 23 positions centered
-                around this index.
+            band_start: Inclusive start index of the band.
+            band_end: Exclusive end index of the band; its last PAM_LEN positions
+                are the PAM.
 
         Returns:
             Tensor of shape [batch, seq_len, d_model] with token-type embeddings
             added. Each position has an embedding corresponding to its biological
-            significance (background, PAM-proximal, or PAM sequence).
+            significance (background, R-loop band, or PAM sequence).
         """
         mask = torch.zeros(x.size(0), x.size(1), device=x.device)
-        start = center - 23//2 - 1
-        end = center + 23//2
-        mask[:, start:end] = 1
-        mask[:, end-3:end] = 2
+        mask[:, band_start:band_end] = 1
+        mask[:, band_end - PAM_LEN:band_end] = 2
         return x + self.token_type_emb(mask.long())
 
 
@@ -562,6 +565,14 @@ class CRISCross(nn.Module):
             - "early": Add epi features to off-target embeddings (requires num_epi > 0)
             - None: Ignore epigenetic features entirely
             - Other values raise error (future fusion strategies)
+        band_delta: Extra PAM-distal margin on the cross-attention band, in
+            half-widths: the band is 23 + 2*band_delta nucleotides wide and is
+            anchored on the PAM rather than on the centre of the window.
+            band_delta=0 reproduces the original centred 23-nt band exactly and
+            is the default. A bulged sample needs band_delta >= 1, because a DNA
+            bulge pushes the PAM-distal end of the protospacer one base further
+            out and a shifted diagonal that falls outside the band cannot be
+            represented at all.
 
     Attributes:
         kernel: K-mer conversion kernel buffer of shape [3] where kernel[i] =
@@ -604,6 +615,7 @@ class CRISCross(nn.Module):
         output_size: int,
         windowsize: int,
         merge: str,
+        band_delta: int = 0,
     ):
         super().__init__()
         self.merge = merge
@@ -611,6 +623,12 @@ class CRISCross(nn.Module):
         self.transformer_dim = hidden_dim
         self.dropout = dropout
         self.vocab_size = vocab_size
+
+        # PAM-anchored cross-attention band. Fixed for every sample: nothing in
+        # the input may reveal the bulge configuration (see CRISCross.bulges).
+        self.band_delta = band_delta
+        self.band_start, self.band_end = band_bounds(windowsize, band_delta)
+        self.band_width = band_width(band_delta)
 
         # K-mer conversion kernel: vocab_size^0, vocab_size^1, vocab_size^2
         self.register_buffer(
@@ -749,14 +767,14 @@ class CRISCross(nn.Module):
         x = torch.cat([cls, x], dim=1)
 
         ot = torch_convolve_int(off_target_x, self.kernel)
-        center = ot.shape[1] // 2 + ot.shape[1] % 2
+        bs, be = self.band_start, self.band_end
 
         # Embeddings
         x = self.target_embedding(x)
         x = self.positional_encoding(x)
 
         ot = self.ot_embedding(ot)
-        ot = self.token_type_emb(ot, center)
+        ot = self.token_type_emb(ot, bs, be)
         ot = self.strand_embedding(ot, strand)
         ot = self.ot_positional_encoding(ot)
 
@@ -766,16 +784,16 @@ class CRISCross(nn.Module):
             ot = ot + epi
             ot = self.ndrop(ot)
 
-        # Transformer layers
+        # Transformer layers. Cross-attention is restricted to the PAM-anchored
+        # band; the band representations are written back in place, which keeps
+        # the surrounding context untouched at whatever width the band has.
         for i in range(self.n_layers):
             x = self.self_attention[i](x)
             ot = self.self_ot_attention[i](ot)
             x_old = x
-            x = self.cross_attention1[i](x, ot[:, center-23//2-1:center+23//2])
+            x = self.cross_attention1[i](x, ot[:, bs:be])
             if i < self.n_layers - 1:
-                ot[:, center-23//2-1:center+23//2] = self.cross_attention2[i](
-                    ot[:, center-23//2-1:center+23//2], x_old
-                )
+                ot[:, bs:be] = self.cross_attention2[i](ot[:, bs:be], x_old)
 
         return self.out_proj(x[:, 0]), x[:, 1:]
 

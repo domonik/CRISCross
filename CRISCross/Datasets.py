@@ -16,6 +16,19 @@ from Bio import SeqIO
 import math
 import multiprocessing
 from CRISCross.energyCalculations import get_eng, calcRNADNAenergy
+from CRISCross.bulges import (
+    PAM_LEN,
+    SITE_LEN,
+    SPACER_LEN,
+    band_bounds,
+    band_width,
+    make_bulged_guide,
+    make_gapless_decoy,
+    normalise_bulge_profile,
+    pam_end_index,
+    sample_bulge_config,
+    site_index_to_band_index,
+)
 from pytorch_lightning.utilities.rank_zero import rank_zero_warn
 
 mp.set_start_method("spawn", force=True)
@@ -187,10 +200,10 @@ class VeryHardDataset(Dataset):
         else:
             epi = 0
         if self.augment:
-            center = off_target_x.shape[0] // 2
-            otc = off_target_x[center - 23//2 - 1:center+23//2]
+            bs, be = band_bounds(off_target_x.shape[0])
+            otc = off_target_x[bs:be]
             target_x, otc = shared_random_swaps(target_x=target_x, off_target_x=otc)
-            off_target_x[center - 23//2 - 1:center+23//2] = otc
+            off_target_x[bs:be] = otc
             
 
         return target_x, off_target_x, epi, y, counts, strand
@@ -550,7 +563,7 @@ def mutate_target(target, alphabet=(1, 2, 3, 4)):
 
 
 class GenomicDataset(Dataset):
-    def __init__(self, chrom_sizes, seq_dict, bw_dir, epi_features, window_size=1000, num_samples=10000, epi_stats=None, atac_features=None, atac_stats=None):
+    def __init__(self, chrom_sizes, seq_dict, bw_dir, epi_features, window_size=1000, num_samples=10000, epi_stats=None, atac_features=None, atac_stats=None, band_delta=0, require_pam=False):
         """
         chrom_sizes: dict of {chrom: length}, e.g., {'chr1': 248956422, ...}
         bigwig_paths: list of paths to bigwig files (each a feature track)
@@ -558,6 +571,12 @@ class GenomicDataset(Dataset):
         num_samples: number of random regions to generate
         atac_features: track names loaded as regression targets only (not model inputs)
         atac_stats: dict with "mean" and "std" tensors for ATAC normalization
+        band_delta: extra PAM-distal margin on the cross-attention band, in
+            half-widths (band is 23 + 2*band_delta nt). 0 reproduces the original
+            centred 23-nt band exactly.
+        require_pam: only accept loci whose candidate site ends in NGG. Off by
+            default because the original sampler places no PAM constraint, and
+            turning it on changes the mismatch-only pretraining distribution.
         """
         self.chrom_sizes = chrom_sizes
         self.bw_dir = bw_dir
@@ -578,9 +597,42 @@ class GenomicDataset(Dataset):
             self.atac_mean = torch.as_tensor(atac_stats["mean"], dtype=torch.float32)
             self.atac_std = torch.as_tensor(atac_stats["std"], dtype=torch.float32).clamp_min(1e-6)
 
+        # PAM-anchored geometry. Every sample shares these bounds regardless of
+        # its bulge configuration -- see CRISCross.bulges for why that matters.
+        self.band_delta = band_delta
+        self.band_start, self.band_end = band_bounds(window_size, band_delta)
+        self.band_width = band_width(band_delta)
+        self.pam_end = pam_end_index(window_size)
+        self.require_pam = require_pam
+
     def __len__(self):
         return self.num_samples
-    
+
+    def _has_ngg(self, off_target_x):
+        """True if the candidate site's PAM (the band's last 3 nt) is NGG."""
+        return bool(
+            off_target_x[self.pam_end - 2] == 3 and off_target_x[self.pam_end - 1] == 3
+        )
+
+    def _build_guide(self, off_target_x):
+        """Derive the guide from an oriented window.
+
+        The base implementation is the original mismatch-only one: copy the
+        candidate site out of the band and substitute a few bases. Subclasses
+        override this to introduce bulges; ``extras`` is how they smuggle
+        training labels (alignment, edit script) out to the batch without
+        touching the model input.
+
+        Args:
+            off_target_x: Long tensor ``[window_size]``, already oriented.
+
+        Returns:
+            ``(target_x, extras)`` -- the 23-nt guide, and a tuple of extra
+            per-sample tensors appended to the end of the batch (empty here).
+        """
+        target_x = off_target_x[self.pam_end - SITE_LEN:self.pam_end].clone()
+        return mutate_target(target_x), ()
+
     def __getitem__(self, idx):
         # Randomly choose a chromosome
         chrom = random.choices(self.chroms, weights=[self.chrom_sizes[c] for c in self.chroms], k=1)[0]
@@ -593,19 +645,22 @@ class GenomicDataset(Dataset):
             start = random.randint(0, max_start)
             end = start + self.window_size
             off_target_x = self.seq_dict[chrom][start:end]
-            center = off_target_x.shape[0] // 2 + off_target_x.shape[0] % 2
-            if ~torch.all(off_target_x[center-23 // 2 - 1: center + 23 // 2] == 0):
+            if torch.all(off_target_x[self.band_start:self.band_end] == 0):
+                continue
+            off_target_x = off_target_x.long()
+            if torch.rand(1) < 0.5:
+                off_target_x = TORCHCOMPLEMENT[off_target_x.flip(-1)]
+                strand = 0
+            else:
+                strand = 1
+            # The PAM check has to happen after the strand flip, so the strand
+            # draw moved inside the loop; with require_pam=False the loop still
+            # runs exactly once per accepted locus, as before.
+            if not self.require_pam or self._has_ngg(off_target_x):
                 break
-        off_target_x = off_target_x.long()
-        if torch.rand(1) < 0.5:
-            off_target_x = TORCHCOMPLEMENT[off_target_x.flip(-1)]
-            strand = 0
-        else:
-            strand = 1
         mask = off_target_x == 0
         off_target_x[mask] = torch.randint(1, 5, (mask.sum(),), device=off_target_x.device, dtype=off_target_x.dtype)
-        target_x = off_target_x[center-23 // 2 - 1: center + 23 // 2].clone()
-        target_x = mutate_target(target_x)
+        target_x, extras = self._build_guide(off_target_x)
 
         # Pick ONE bw_dir per sample so all tracks are from the same cell type
         bw_dir = np.random.choice(self.bw_dir)
@@ -650,7 +705,7 @@ class GenomicDataset(Dataset):
 
         y = 0
         counts = 0
-        return target_x, off_target_x, epi, y, counts, strand, atac
+        return (target_x, off_target_x, epi, y, counts, strand, atac) + extras
 
     def close(self):
         for bw in self.bigwigs:
@@ -734,7 +789,7 @@ class FineTuningGenomicDataset(Dataset):
 
 
 class EnergyGenomicDataset(GenomicDataset):
-    def __init__(self, *args, **kwargs): 
+    def __init__(self, *args, **kwargs):
         if "energy_stats" in kwargs:
             self.energy_stats = kwargs["energy_stats"]
             del kwargs["energy_stats"]
@@ -742,19 +797,21 @@ class EnergyGenomicDataset(GenomicDataset):
         else:
             self.energy_stats = None
         super().__init__( *args, **kwargs)
-    
-    def __getitem__(self, idx):
-        target_x, off_target_x, epi, y, counts, strands, atac = super().__getitem__(idx)
+
+    def _candidate_site(self, off_target_x):
+        """The 23-nt PAM-proximal candidate site inside the band.
+
+        ``calcRNADNAenergy`` pairs the guide and the target position by position,
+        so it needs the 23-nt candidate, not the (possibly wider) band.
+        """
+        return off_target_x[self.pam_end - SITE_LEN:self.pam_end]
+
+    def _compute_energy(self, target_x, off_target_x):
         tx = target_x.cpu().numpy()
-        target_seq = b''.join(REV_MAPPING[tx]).decode('ascii')       # reverse            # complement                 # move to CPU if needed
-        #target_seq = REVMAP_RNA[COMP_MAPPING[target_x.cpu()].flip(0).numpy()]
-        #target_seq = b''.join(target_seq).decode('ascii')
- 
-        center = off_target_x.shape[0] // 2 + off_target_x.shape[0] % 2
-    
-        assert (off_target_x[center-23 // 2 - 1: center + 23 // 2] == target_x).sum() >= 15
-        off_target_seq = REV_MAPPING[off_target_x[center-23 // 2 - 1: center + 23 // 2].cpu().numpy()]
-        off_target_seq = b''.join(off_target_seq).decode('ascii')
+        target_seq = b''.join(REV_MAPPING[tx]).decode('ascii')
+
+        site = self._candidate_site(off_target_x)
+        off_target_seq = b''.join(REV_MAPPING[site.cpu().numpy()]).decode('ascii')
         energy = get_eng(
             target_seq, off_target_seq,
             calcRNADNAenergy,
@@ -767,8 +824,130 @@ class EnergyGenomicDataset(GenomicDataset):
         )
         if self.energy_stats:
             energy = (energy - self.energy_stats[0]) / self.energy_stats[1]
+        return energy
 
+    def __getitem__(self, idx):
+        target_x, off_target_x, epi, y, counts, strands, atac = super().__getitem__(idx)
+        assert (self._candidate_site(off_target_x) == target_x).sum() >= 15
+        energy = self._compute_energy(target_x, off_target_x)
         return target_x, off_target_x, epi, y, energy, strands, atac
+
+
+class BulgeGenomicDataset(GenomicDataset):
+    """CRISPRAT sampler extended to DNA and RNA bulges.
+
+    Emits exactly the same seven fields as :class:`GenomicDataset` plus three
+    label tensors:
+
+    ==================  ==========================================================
+    ``align``           long ``[23]`` -- band column paired with each guide
+                        position, ``-1`` for an unpaired guide base (RNA bulge)
+    ``edits``           long ``[3]`` -- ``(m, b_D, b_R)``
+    ``gapless``         uint8 scalar -- 1 if ``b_D == b_R == 0``. Doubles as the
+                        mask for the hybrid-energy objective, which is only
+                        defined for ungapped pairs.
+    ==================  ==========================================================
+
+    None of these ever enters the model as an input. The guide is 23 tokens and
+    the window is ``window_size`` tokens for every sample, whatever the bulge
+    configuration.
+
+    Args:
+        bulge_profile: ``(b_D, b_R) -> weight`` table; defaults to
+            :data:`CRISCross.bulges.DEFAULT_BULGE_PROFILE`.
+        bulge_rate: If given, overrides the gapless share of the profile --
+            this is the knob for the 0/5/20/50/100 % ablation sweep.
+        mismatch_span: ``"site"`` (default, matches the original sampler, which
+            also mutates PAM positions) or ``"spacer"``.
+        mismatch_base_factor: 3 reproduces the original mismatch-count
+            distribution; 1 gives the position-only form from the spec.
+        position_tilt / mismatch_tilt: PAM-distal tilt strength; 0 is uniform.
+        canonicalise_homopolymers: leftmost placement for ambiguous bulges.
+        emit_decoy: additionally emit a synthetic gapless decoy site ``[23]``
+            with a matched edit count, for the contrastive objective. The decoy
+            has no genomic coordinate, so it must not be paired with epi tracks.
+    """
+
+    def __init__(
+        self,
+        *args,
+        bulge_profile=None,
+        bulge_rate=None,
+        mismatch_span="site",
+        mismatch_base_factor=3,
+        position_tilt=0.0,
+        mismatch_tilt=0.0,
+        canonicalise_homopolymers=True,
+        emit_decoy=False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.bulge_profile = normalise_bulge_profile(bulge_profile, bulge_rate)
+        self.mismatch_span = mismatch_span
+        self.mismatch_base_factor = mismatch_base_factor
+        self.position_tilt = position_tilt
+        self.mismatch_tilt = mismatch_tilt
+        self.canonicalise_homopolymers = canonicalise_homopolymers
+        self.emit_decoy = emit_decoy
+
+        # The widest protospacer the profile can produce must still fit in the
+        # band, otherwise part of the true alignment would be unrepresentable.
+        max_b_D = max(
+            (b_D for (b_D, _), w in self.bulge_profile.items() if w > 0), default=0
+        )
+        needed = SPACER_LEN + max_b_D + PAM_LEN
+        if needed > self.band_width:
+            raise ValueError(
+                f"band of width {self.band_width} (band_delta={self.band_delta}) cannot hold a "
+                f"{needed}-nt site (b_D up to {max_b_D}); use band_delta >= "
+                f"{math.ceil((needed - SITE_LEN) / 2)}"
+            )
+
+    def _build_guide(self, off_target_x):
+        b_D, b_R = sample_bulge_config(self.bulge_profile)
+        L = SPACER_LEN + b_D - b_R
+        site = off_target_x[self.pam_end - (L + PAM_LEN):self.pam_end]
+        target_x, align_site, m = make_bulged_guide(
+            site,
+            b_D,
+            b_R,
+            mismatch_span=self.mismatch_span,
+            mismatch_base_factor=self.mismatch_base_factor,
+            position_tilt=self.position_tilt,
+            mismatch_tilt=self.mismatch_tilt,
+            canonicalise_homopolymers=self.canonicalise_homopolymers,
+        )
+        align = site_index_to_band_index(align_site, self.band_width)
+        edits = torch.tensor([m, b_D, b_R], dtype=torch.long)
+        gapless = torch.tensor(int(b_D == 0 and b_R == 0), dtype=torch.uint8)
+        extras = (align, edits, gapless)
+        if self.emit_decoy:
+            extras = extras + (
+                make_gapless_decoy(target_x, m + b_D + b_R, mismatch_span=self.mismatch_span),
+            )
+        return target_x, extras
+
+
+class BulgeEnergyGenomicDataset(BulgeGenomicDataset, EnergyGenomicDataset):
+    """:class:`BulgeGenomicDataset` with the masked hybrid-energy target.
+
+    The R-loop energy model of CRISPRoff is defined only for ungapped
+    guide-target pairs, so the energy is computed on the gapless subset and
+    reported as 0 elsewhere. ``gapless`` (field 9) is the loss mask: normalise
+    the regression loss over the unmasked samples per batch. The mask is not a
+    model input, so the model cannot condition on it.
+    """
+
+    def __getitem__(self, idx):
+        target_x, off_target_x, epi, y, counts, strands, atac, align, edits, *rest = \
+            GenomicDataset.__getitem__(self, idx)
+        gapless = rest[0]
+        if bool(gapless):
+            assert (self._candidate_site(off_target_x) == target_x).sum() >= 15
+            energy = self._compute_energy(target_x, off_target_x)
+        else:
+            energy = 0.0
+        return (target_x, off_target_x, epi, y, energy, strands, atac, align, edits) + tuple(rest)
 
 
 
@@ -832,7 +1011,7 @@ CHROMOSOME_SIZES = {
 
 
 class GenomicDataModule(pl.LightningDataModule):
-    def __init__(self, fasta_path, epi_features, bw_dir, window_size=512, batch_size=32, num_workers=4, num_samples=10000, norm_epi=False, use_energy=False, mode="np", df=None, val_guides=None, test_guides=None, atac_features=None, norm_num_samples=10000):
+    def __init__(self, fasta_path, epi_features, bw_dir, window_size=512, batch_size=32, num_workers=4, num_samples=10000, norm_epi=False, use_energy=False, mode="np", df=None, val_guides=None, test_guides=None, atac_features=None, norm_num_samples=10000, band_delta=0, bulge_profile=None, bulge_rate=None, require_pam=False, mismatch_span="site", mismatch_base_factor=3, position_tilt=0.0, mismatch_tilt=0.0, canonicalise_homopolymers=True, emit_decoy=False):
         super().__init__()
         self.chrom_sizes = None
         self.seq_dict = None
@@ -882,15 +1061,48 @@ class GenomicDataModule(pl.LightningDataModule):
         self.norm_epi = norm_epi
         self.norm_num_samples = norm_num_samples
 
+        # --- bulge configuration -------------------------------------------
+        # Bulges are only ever introduced by the synthetic (pretraining)
+        # sampler; the fine-tuning path reads real sites from a dataframe and is
+        # untouched by any of this.
+        self.band_delta = band_delta
+        self.require_pam = require_pam
+        self.use_bulges = bulge_profile is not None or bulge_rate is not None
+        self.bulge_kwargs = dict(
+            bulge_profile=bulge_profile,
+            bulge_rate=bulge_rate,
+            mismatch_span=mismatch_span,
+            mismatch_base_factor=mismatch_base_factor,
+            position_tilt=position_tilt,
+            mismatch_tilt=mismatch_tilt,
+            canonicalise_homopolymers=canonicalise_homopolymers,
+            emit_decoy=emit_decoy,
+        )
+
+    def _synthetic_dataset_kwargs(self, with_bulges=True):
+        """Common kwargs for the synthetic sampler, with or without bulges."""
+        kwargs = dict(band_delta=self.band_delta, require_pam=self.require_pam)
+        if with_bulges and self.use_bulges:
+            kwargs.update(self.bulge_kwargs)
+        return kwargs
+
+    def _synthetic_dataset_class(self, with_bulges=True):
+        if with_bulges and self.use_bulges:
+            return BulgeEnergyGenomicDataset if self.use_energy else BulgeGenomicDataset
+        return EnergyGenomicDataset if self.use_energy else GenomicDataset
+
     def _norm_eng(self):
-        dataset = EnergyGenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, self.norm_num_samples)
+        # Deliberately gapless: the hybrid-energy target is only defined for
+        # ungapped pairs, so its normalisation statistics must come from the
+        # same (gapless) subset the objective is supervised on.
+        dataset = EnergyGenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, self.norm_num_samples, **self._synthetic_dataset_kwargs(with_bulges=False))
         dl = DataLoader(dataset, sampler= None, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=False)
         stats = estimate_energy_stats(dl)
         return stats
 
-    
+
     def _norm_epi(self):
-        dataset = GenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, self.norm_num_samples)
+        dataset = GenomicDataset(self.chrom_sizes, self.seq_dict, self.local_bw_dirs, self.epi_features, self.window_size, self.norm_num_samples, **self._synthetic_dataset_kwargs(with_bulges=False))
         dl = DataLoader(dataset, sampler=None, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=False)
         stats = estimate_all_stats(dl)
         return stats
@@ -905,6 +1117,7 @@ class GenomicDataModule(pl.LightningDataModule):
             num_samples=self.norm_num_samples,
             atac_features=self.atac_features,
             atac_stats=None,  # no normalisation yet — collect raw log1p values
+            **self._synthetic_dataset_kwargs(with_bulges=False),
         )
         dl = DataLoader(dataset, sampler=None, batch_size=self.batch_size, num_workers=min(4, self.num_workers), persistent_workers=False)
         all_atac = []
@@ -1055,7 +1268,13 @@ class GenomicDataModule(pl.LightningDataModule):
 
         else:
 
-            df_class = EnergyGenomicDataset if self.use_energy else GenomicDataset
+            df_class = self._synthetic_dataset_class()
+            kwargs.update(self._synthetic_dataset_kwargs())
+            if self.use_bulges:
+                print(
+                    f"[DATA] bulge-aware sampler: {df_class.__name__}, band_delta={self.band_delta} "
+                    f"(band width {band_width(self.band_delta)}), require_pam={self.require_pam}"
+                )
 
             self.dataset = df_class(
                 chrom_sizes=self.chrom_sizes,

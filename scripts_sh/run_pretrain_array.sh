@@ -1,15 +1,20 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH --job-name=criscross_pretrain
 #SBATCH --partition=gpu-single
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00                # adjust to how long a full pretraining run needs
-#SBATCH --array=0-REPLACE_ME           # one task per entry in the config JSON (see note below)
 #SBATCH --output=logs/slurm/pretrain_%A_%a.out
 #SBATCH --error=logs/slurm/pretrain_%A_%a.err
 
+# NOTE: `set -euo pipefail` must stay BELOW this header. SLURM stops reading
+# #SBATCH directives at the first command, so a `set` line above them silently
+# disables every directive in this block.
+#
+# The array range is passed on the command line -- one task per entry in the
+# config JSON:  sbatch --array=0-<n-1> scripts_sh/run_pretrain_array.sh
+#
 # NOTE: logs/slurm/ must exist before sbatch is called.
 # Run once on the cluster: mkdir -p logs/slurm
 #

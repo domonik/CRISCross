@@ -248,6 +248,76 @@ CRISCross uses a transformer-based architecture with:
 | `CRISCross` | Main transformer model (`CRISCross/models.py`) |
 | `GenomicDataModule` | PyTorch Lightning data module (`CRISCross/Datasets.py`) |
 | `FineTuningGenomicDataset` | Dataset class for dataframe-based fine-tuning |
+| `CRISCross.bulges` | Bulge sampling and PAM-anchored band geometry |
+| `BulgeGenomicDataset` | Bulge-aware synthetic pretraining sampler |
+| `CRISCross.leakageProbe` | Checks that no input reveals the bulge configuration |
+
+## Bulges (DNA/RNA indels)
+
+The synthetic pretraining sampler can produce guide/target pairs containing
+bulges — indels in the guide–target alignment — in addition to mismatches.
+
+**Bulges are never encoded.** There are no gap tokens, no bulge-type embedding
+and no unpaired-position label. The model input is unchanged: a 23-nt guide
+(20-nt spacer + 3-nt PAM) and a contiguous genomic window of fixed width. A
+bulge is a property of the *alignment* between the two, which is left for
+cross-attention to infer.
+
+| Symbol | Meaning | Effect |
+|---|---|---|
+| `m` | mismatch | protospacer length unchanged |
+| `b_D` | DNA bulge — unpaired base on the DNA side | protospacer **longer** |
+| `b_R` | RNA bulge — unpaired base on the guide side | protospacer **shorter** |
+
+Length invariant: guide spacer is always 20 nt; protospacer is `20 + b_D - b_R`.
+Budget: `m + b_D + b_R <= 6` and `b_D + b_R <= 2`.
+
+### Turning bulges on
+
+Add these keys to a pretraining config (all optional; omit every one of them and
+the run is the original mismatch-only pretraining):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `band_delta` | `0` | Cross-attention band is `23 + 2*band_delta` nt, PAM-anchored. **Bulges need `>= 1`**; 2 is recommended. |
+| `bulge_rate` | `None` | Fraction of bulged samples. Sets the gapless/bulged split directly — this is the ablation knob. |
+| `bulge_profile` | `None` | Full `(b_D, b_R)` table. In JSON, write keys as `"1,0"`. |
+| `require_pam` | `false` | Only sample loci whose candidate site ends in NGG. |
+| `mismatch_span` | `"site"` | `"site"` also mutates PAM positions (original behaviour); `"spacer"` does not. |
+| `mismatch_base_factor` | `3` | `3` reproduces the original mismatch-count distribution; `1` is the position-only form. |
+| `position_tilt` | `0.0` | PAM-distal tilt for bulge placement; 0 is uniform. |
+| `emit_decoy` | `false` | Also emit a gapless decoy site with a matched edit count. |
+
+Bulged batches carry three extra fields after the usual seven: `align` (the
+ground-truth alignment, `[B, 23]` band columns, `-1` where unpaired), `edits`
+(`[B, 3]` = `m, b_D, b_R`) and `gapless` (`[B]`). All three are **labels** and
+never enter the model.
+
+The hybrid-energy objective (`use_energy`) is only defined for ungapped pairs,
+so it is supervised on the gapless subset and normalised over it per batch;
+`gapless` is that mask.
+
+### The ablation sweep
+
+```bash
+python examples/make_bulge_sweep_config.py \
+    --out configs/bulge_sweep.json --include-legacy-control
+sbatch --array=0-5 scripts_sh/run_pretrain_array.sh   # edit CONFIG_PATH first
+```
+
+### Leakage probe
+
+Nothing in the input may reveal `(b_D, b_R)`. Verify with:
+
+```bash
+python -m CRISCross.leakageProbe --synthetic --band-delta 2 --bulge-rate 0.5
+```
+
+It asserts the structural invariants (guide/window/band widths and the region
+label are identical across bulge configurations) and trains a shape-only
+classifier that must stay at the majority baseline. A third, informational probe
+on the sequences themselves is *expected* to beat chance — that is the task, not
+a leak.
 
 ## Prerequisites
 

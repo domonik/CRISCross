@@ -16,6 +16,7 @@ import collections
 from typing import Dict, List, Tuple
 from CRISCross.models import CRISCross
 from CRISCross.Datasets import MyDataModule, EPI_FEATURES, GenomicDataModule
+from CRISCross.bulges import SITE_LEN, band_bounds
 import json
 from torchmetrics import Metric
 from torchmetrics.functional import spearman_corrcoef
@@ -42,9 +43,9 @@ class SpearmanCorr(Metric):
 
 
 class PLCRISPRWrapper(pl.LightningModule):
-    def __init__(self, model_type, embed_size, context_layers, hidden_dim, num_epi, dropout, seed, windowsize, merge, lr=1e-4, borders = None):
+    def __init__(self, model_type, embed_size, context_layers, hidden_dim, num_epi, dropout, seed, windowsize, merge, lr=1e-4, borders = None, band_delta=0):
         super().__init__()
-        
+
         if borders is not None:
             raise NotImplementedError()
             self.criterion = BarDistributionConfig(full_support=True, borders=borders).get_criterion()
@@ -65,9 +66,12 @@ class PLCRISPRWrapper(pl.LightningModule):
             num_epi=num_epi,
             output_size=self.output_size,
             windowsize=windowsize,
-            merge=merge
+            merge=merge,
+            band_delta=band_delta,
         )
-        
+        self.band_delta = band_delta
+        self.band_start, self.band_end = band_bounds(windowsize, band_delta)
+
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
         self.hparams.n_trainable_params = n_params
@@ -86,9 +90,12 @@ class PLCRISPRWrapper(pl.LightningModule):
 
     def general_step(self, batch):
             
-        target_x, off_target_x, epi, y, counts, strands = batch
-        center = off_target_x.shape[1] // 2 + off_target_x.shape[1] % 2
-        t_vals = (off_target_x[:, center - 23//2 - 1:center+23//2] == target_x).sum(axis=1)
+        target_x, off_target_x, epi, y, counts, strands = batch[:6]
+        # Real off-targets are mismatch-only for now, so the candidate site is
+        # compared straight down the diagonal from the PAM. Fine-tuning on
+        # bulge-containing positives (Phase 3) will need this relaxed.
+        site = off_target_x[:, self.band_end - SITE_LEN:self.band_end]
+        t_vals = (site == target_x).sum(axis=1)
         mval = t_vals.min()
         assert mval >= 15, f"Min of {mval} detected"
 
@@ -337,7 +344,8 @@ def run_training(config):
             seed=seed,
             borders=borders,
             windowsize=windowsize,
-            merge=merge
+            merge=merge,
+            band_delta=config.get("band_delta", 0),
 
         )
         if "chkpt" in config:
@@ -348,6 +356,16 @@ def run_training(config):
             try:
                 ptm = PreTrainModel.load_from_checkpoint(cur_chkpt, weights_only=False)
                 print("Using pretrained model")
+                # The band geometry is not stored in the weights, so a mismatch
+                # here would silently feed the model a differently-placed band
+                # than it was pretrained on.
+                pretrained_delta = getattr(ptm.model, "band_delta", 0)
+                if pretrained_delta != model.model.band_delta:
+                    raise ValueError(
+                        f"checkpoint was pretrained with band_delta={pretrained_delta} but this "
+                        f"fine-tuning run uses band_delta={model.model.band_delta}; set "
+                        f'"band_delta": {pretrained_delta} in the config'
+                    )
                 model.model.load_state_dict(ptm.model.state_dict())
             except TypeError:
                 ptm = PLCRISPRWrapper.load_from_checkpoint(cur_chkpt, weights_only=False)

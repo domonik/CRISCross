@@ -1,0 +1,45 @@
+[
+  {
+    "batch_size": 1,
+    "context_layers": 3,
+    "hidden_dim": 512,
+    "embed_size": 32,
+    "dropout": 0.2,
+    "epi_features": [
+      "H3K27ac",
+      "H3K27me3",
+      "H3K36me3",
+      "H3K4me1",
+      "H3K4me3",
+      "H3K9me3"
+    ],
+    "lr": 0.0001,
+    "patience": 100000,
+    "split": 1,
+    "experiment": "PretrainingBulgeSmoke",
+    "regression": false,
+    "windowsize": 512,
+    "merge": "early",
+    "model_type": "crosscrispr",
+    "use_energy": false,
+    "bw_dir": [
+      "AGTensorsCL:0000624"
+    ],
+    "epi_mode": "np",
+    "atac_features": [
+      "ATAC"
+    ],
+    "atac_weight": 0.1,
+    "accumulate_grad_batches": 1,
+    "max_steps": 20,
+    "num_workers": 4,
+    "norm_num_samples": 64,
+    "mismatch_span": "site",
+    "mismatch_base_factor": 3,
+    "position_tilt": 0.0,
+    "canonicalise_homopolymers": true,
+    "seed": 0,
+    "bulge_rate": 0.2,
+    "band_delta": 2
+  }
+]

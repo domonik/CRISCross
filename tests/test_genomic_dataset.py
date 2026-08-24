@@ -272,7 +272,7 @@ class TestGenomicDatasetGetItem:
 
     def test_return_tuple_structure(self, genomic_dataset_mock):
         """Test that __getitem__ returns a 6-element tuple."""
-        target_x, off_target_x, epi, y, counts, strand = genomic_dataset_mock[0]
+        target_x, off_target_x, epi, y, counts, strand, atac = genomic_dataset_mock[0]
 
         # Check tuple structure
         assert isinstance(target_x, torch.Tensor)
@@ -284,17 +284,17 @@ class TestGenomicDatasetGetItem:
 
     def test_target_sequence_length(self, genomic_dataset_mock):
         """Test that target sequence is 23bp (guide length)."""
-        target_x, _, _, _, _, _ = genomic_dataset_mock[0]
+        target_x, _, _, _, _, _, _ = genomic_dataset_mock[0]
         assert target_x.shape[0] == 23
 
     def test_off_target_sequence_length(self, genomic_dataset_mock):
         """Test that off-target sequence matches window_size."""
-        _, off_target_x, _, _, _, _ = genomic_dataset_mock[0]
+        _, off_target_x, _, _, _, _, _ = genomic_dataset_mock[0]
         assert off_target_x.shape[0] == genomic_dataset_mock.window_size
 
     def test_valid_base_values(self, genomic_dataset_mock):
         """Test that all base values are in valid range [1, 4]."""
-        target_x, off_target_x, _, _, _, _ = genomic_dataset_mock[0]
+        target_x, off_target_x, _, _, _, _, _ = genomic_dataset_mock[0]
 
         # N bases (0) should be replaced with random bases
         assert (target_x >= 1).all()
@@ -304,7 +304,7 @@ class TestGenomicDatasetGetItem:
 
     def test_target_is_centered_in_off_target(self, genomic_dataset_mock):
         """Test that target sequence corresponds to center of off-target."""
-        target_x, off_target_x, _, _, _, strand = genomic_dataset_mock[0]
+        target_x, off_target_x, _, _, _, strand, _ = genomic_dataset_mock[0]
 
         window_size = genomic_dataset_mock.window_size
         center = window_size // 2 + window_size % 2
@@ -320,7 +320,7 @@ class TestGenomicDatasetGetItem:
         """Test that strand is either 0 (reverse) or 1 (forward)."""
         strands = set()
         for i in range(100):
-            _, _, _, _, _, strand = genomic_dataset_mock[i % len(genomic_dataset_mock)]
+            _, _, _, _, _, strand, _ = genomic_dataset_mock[i % len(genomic_dataset_mock)]
             strands.add(strand)
 
         # Strand should only be 0 or 1
@@ -328,7 +328,7 @@ class TestGenomicDatasetGetItem:
 
     def test_epigenetic_features_shape(self, genomic_dataset_mock, mock_epi_features):
         """Test that epigenetic features have correct shape."""
-        _, _, epi, _, _, _ = genomic_dataset_mock[0]
+        _, _, epi, _, _, _, _ = genomic_dataset_mock[0]
 
         # epi should be [window_size, num_features]
         assert epi.shape[0] == genomic_dataset_mock.window_size
@@ -336,7 +336,7 @@ class TestGenomicDatasetGetItem:
 
     def test_epigenetic_no_nans(self, genomic_dataset_mock):
         """Test that epigenetic features have no NaN values."""
-        _, _, epi, _, _, _ = genomic_dataset_mock[0]
+        _, _, epi, _, _, _, _ = genomic_dataset_mock[0]
         assert not torch.isnan(epi).any()
 
 
@@ -364,7 +364,7 @@ class TestSequenceTransformation:
         reverse_seq = None
 
         for i in range(100):
-            _, off_target_x, _, _, _, strand = dataset[i % len(dataset)]
+            _, off_target_x, _, _, _, strand, _ = dataset[i % len(dataset)]
             if strand == 1 and forward_seq is None:
                 forward_seq = off_target_x.clone()
             elif strand == 0 and reverse_seq is None:
@@ -408,7 +408,7 @@ class TestEpigeneticFeatures:
             num_samples=10,
         )
 
-        _, _, epi, _, _, _ = dataset[0]
+        _, _, epi, _, _, _, _ = dataset[0]
         assert epi.shape == (512, 1)
 
     def test_multiple_features(
@@ -424,7 +424,7 @@ class TestEpigeneticFeatures:
             num_samples=10,
         )
 
-        _, _, epi, _, _, _ = dataset[0]
+        _, _, epi, _, _, _, _ = dataset[0]
         assert epi.shape == (512, 2)  # 2 features
 
     def test_normalization_applied(
@@ -446,7 +446,7 @@ class TestEpigeneticFeatures:
             epi_stats=epi_stats,
         )
 
-        _, _, epi, _, _, _ = dataset[0]
+        _, _, epi, _, _, _, _ = dataset[0]
 
         # Normalized features should have mean ~0 and std ~1
         # (approximately, due to random sampling)
@@ -471,7 +471,7 @@ class TestEpigeneticFeatures:
             epi_stats=epi_stats,
         )
 
-        _, _, epi, _, _, _ = dataset[0]
+        _, _, epi, _, _, _, _ = dataset[0]
         assert epi.shape == (512, 2)
 
     def test_strand_flip_for_epigenetics(
@@ -493,7 +493,7 @@ class TestEpigeneticFeatures:
         reverse_epi = None
 
         for i in range(100):
-            _, _, epi, _, _, strand = dataset[i % len(dataset)]
+            _, _, epi, _, _, strand, _ = dataset[i % len(dataset)]
             if strand == 1 and forward_epi is None:
                 forward_epi = epi.clone()
             elif strand == 0 and reverse_epi is None:
@@ -526,7 +526,7 @@ class TestEdgeCases:
             num_samples=10,
         )
 
-        _, off_target_x, epi, _, _, _ = dataset[0]
+        _, off_target_x, epi, _, _, _, _ = dataset[0]
         assert off_target_x.shape[0] == 100
         assert epi.shape[0] == 100
 
@@ -534,8 +534,14 @@ class TestEdgeCases:
         self, mock_chrom_sizes, mock_seq_dict, mock_bigwig_files, mock_epi_features
     ):
         """Test with a large window size."""
+        # mock_chrom_sizes has a 2000nt chromosome, which is exactly the window
+        # size and therefore legitimately raises (see
+        # test_chromosome_shorter_than_window_raises_error). Drop it so this
+        # test measures what it means to measure rather than flaking on the
+        # chromosome draw.
+        chrom_sizes = {c: n for c, n in mock_chrom_sizes.items() if n > 2000}
         dataset = GenomicDataset(
-            chrom_sizes=mock_chrom_sizes,
+            chrom_sizes=chrom_sizes,
             seq_dict=mock_seq_dict,
             bw_dir=[mock_bigwig_files],
             epi_features=mock_epi_features,
@@ -543,7 +549,7 @@ class TestEdgeCases:
             num_samples=10,
         )
 
-        _, off_target_x, epi, _, _, _ = dataset[0]
+        _, off_target_x, epi, _, _, _, _ = dataset[0]
         assert off_target_x.shape[0] == 2000
         assert epi.shape[0] == 2000
 
@@ -561,7 +567,7 @@ class TestEdgeCases:
         )
 
         assert len(dataset) == 1
-        _, _, epi, _, _, _ = dataset[0]
+        _, _, epi, _, _, _, _ = dataset[0]
         assert epi is not None
 
     def test_chromosome_shorter_than_window_raises_error(
@@ -606,14 +612,14 @@ class TestEdgeCases:
             )
 
             # Should work without errors
-            _, _, epi, _, _, _ = dataset[0]
+            _, _, epi, _, _, _, _ = dataset[0]
             assert epi.shape == (512, len(mock_epi_features))
         finally:
             shutil.rmtree(second_dir)
 
     def test_samples_have_correct_types(self, genomic_dataset_mock):
         """Test that samples have correct data types."""
-        target_x, off_target_x, epi, y, counts, strand = genomic_dataset_mock[0]
+        target_x, off_target_x, epi, y, counts, strand, atac = genomic_dataset_mock[0]
 
         # Verify types
         assert isinstance(target_x, torch.Tensor)
@@ -655,7 +661,7 @@ class TestGenomicDatasetDataLoader:
 
         batch_count = 0
         for batch in dataloader:
-            target_x, off_target_x, epi, y, counts, strand = batch
+            target_x, off_target_x, epi, y, counts, strand, atac = batch
 
             assert target_x.shape[0] == 4  # batch_size
             assert off_target_x.shape[0] == 4
@@ -684,7 +690,7 @@ class TestGenomicDatasetDataLoader:
 
         # Should iterate without errors
         for batch in dataloader:
-            target_x, off_target_x, epi, y, counts, strand = batch
+            target_x, off_target_x, epi, y, counts, strand, atac = batch
             assert target_x.shape[0] == 4
 
     def test_dataloader_num_workers(
@@ -706,5 +712,5 @@ class TestGenomicDatasetDataLoader:
 
         # Should iterate without errors
         for batch in dataloader:
-            target_x, off_target_x, epi, y, counts, strand = batch
+            target_x, off_target_x, epi, y, counts, strand, atac = batch
             assert target_x.shape[0] == 4

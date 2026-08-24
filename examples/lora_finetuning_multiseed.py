@@ -42,6 +42,10 @@ def load_criscross_with_lora(ckpt_path: str, lora_r: int = 8, lora_alpha: int = 
         "output_size": 1,
         "windowsize": ptm.hparams.windowsize,
         "merge": "early",
+        # The cross-attention band geometry is not stored in the weights, so it
+        # has to be carried over from the checkpoint too: a bulge-pretrained
+        # backbone rebuilt at band_delta=0 would silently see a different band.
+        "band_delta": getattr(ptm.model, "band_delta", 0),
     }
     model = CRISCross(**cfg)
     model.load_state_dict(ptm.model.state_dict())

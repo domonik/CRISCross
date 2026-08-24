@@ -390,7 +390,7 @@ class TestGenomicDataModuleDataLoaders:
 
         batch_count = 0
         for batch in train_loader:
-            target_x, off_target_x, epi, y, counts, strand = batch
+            target_x, off_target_x, epi, y, counts, strand, atac = batch
 
             assert target_x.shape[0] == 4  # batch_size
             assert off_target_x.shape[0] == 4
@@ -408,7 +408,7 @@ class TestGenomicDataModuleDataLoaders:
         val_loader = dm.val_dataloader()
 
         for batch in val_loader:
-            target_x, off_target_x, epi, y, counts, strand = batch
+            target_x, off_target_x, epi, y, counts, strand, atac = batch
 
             assert target_x.shape[0] <= 4  # Last batch may be smaller
             break  # Just test one batch

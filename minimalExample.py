@@ -71,6 +71,10 @@ if __name__ == "__main__":
         "output_size": 1,
         "windowsize": 512,
         "merge": "early",
+        # The cross-attention band geometry is not stored in the weights, so it
+        # has to be carried over from the checkpoint too: a bulge-pretrained
+        # backbone rebuilt at band_delta=0 would silently see a different band.
+        "band_delta": getattr(ptm.model, "band_delta", 0),
     }
 
     model = CRISCross(**cfg)

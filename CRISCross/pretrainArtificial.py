@@ -16,6 +16,7 @@ import collections
 from typing import Dict, List, Tuple
 from CRISCross.models import CRISCross
 from CRISCross.Datasets import GenomicDataModule, EPI_FEATURES, MAPPING, EPI_WEIGHTS
+from CRISCross.bulges import SITE_LEN, band_bounds, band_width, identity_alignment
 import json
 from torchmetrics import Metric
 from torchmetrics.functional import spearman_corrcoef
@@ -37,7 +38,13 @@ def short_hash(epi_features, length=6):
 
 def get_logger(config):
     epi_hash = short_hash(config["epi_features"])
-    base_dir = f"RUNlogs/{config['experiment']}/test_split{config['split']}/ctl{config['context_layers']}_bs{config['batch_size']}_ws{config['windowsize']}_ue{config['num_epi']}_seed{config['seed']}_energy{config['use_energy']}_hash{epi_hash}"
+    # Bulge settings go in the run directory name so that the points of the
+    # bulge-rate sweep do not overwrite each other's checkpoints. Omitted
+    # entirely when unset, so existing mismatch-only run paths are unchanged.
+    bulge_tag = ""
+    if config.get("band_delta") or config.get("bulge_rate") is not None or config.get("bulge_profile"):
+        bulge_tag = f"_bd{config.get('band_delta', 0)}_br{config.get('bulge_rate', 'prof')}"
+    base_dir = f"RUNlogs/{config['experiment']}/test_split{config['split']}/ctl{config['context_layers']}_bs{config['batch_size']}_ws{config['windowsize']}_ue{config['num_epi']}_seed{config['seed']}_energy{config['use_energy']}_hash{epi_hash}{bulge_tag}"
     run_dir = os.path.join(base_dir, "run_")
     existing = os.listdir(run_dir) if os.path.exists(run_dir) else []
     version = f"v{len(existing)}"
@@ -51,9 +58,32 @@ def get_logger(config):
     return logger
 
 class PreTrainModel(pl.LightningModule):
-    def __init__(self, context_layers, hidden_dim, num_epi, dropout, seed, windowsize, merge, epi_weights, lr=1e-4, borders=None, use_energy=False, num_atac=0, atac_weight=0.1):
+    """Masked-token pretraining on CRISPRAT-style synthetic guide/target pairs.
+
+    Bulge handling
+    --------------
+    Batches may carry three extra fields produced by
+    :class:`CRISCross.Datasets.BulgeGenomicDataset`: the ground-truth
+    ``align`` map, the ``edits`` script, and a ``gapless`` flag. All three are
+    *labels*. When they are absent the module falls back to the gapless
+    diagonal, which makes every code path below collapse onto the original
+    mismatch-only computation exactly.
+
+    Two invariants are worth spelling out, because breaking either would leak
+    the bulge configuration into the model input:
+
+    - The off-target band and the epigenetic track are masked along the **fixed
+      diagonal**, never along the true alignment. Masking along the true
+      alignment would make the guide and band zero-patterns line up, and the
+      model could read the alignment straight off its own input.
+    - The masking probability does not depend on whether a guide position is
+      paired. Unpaired positions (RNA bulges) are masked at the same rate as any
+      other and are excluded from the *loss* instead.
+    """
+
+    def __init__(self, context_layers, hidden_dim, num_epi, dropout, seed, windowsize, merge, epi_weights, lr=1e-4, borders=None, use_energy=False, num_atac=0, atac_weight=0.1, band_delta=0):
         super().__init__()
-        
+
         if borders is not None:
             raise NotImplementedError("Not yet implemented")
             self.criterion = BarDistributionConfig(full_support=True, borders=borders).get_criterion()
@@ -73,11 +103,15 @@ class PreTrainModel(pl.LightningModule):
             num_epi=num_epi,
             output_size=self.output_size,
             windowsize=windowsize,
-            merge=merge
+            merge=merge,
+            band_delta=band_delta,
 
         )
         self.windowsize = windowsize
-        
+        self.band_delta = band_delta
+        self.band_start, self.band_end = band_bounds(windowsize, band_delta)
+        self.band_w = band_width(band_delta)
+
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
         self.hparams.n_trainable_params = n_params
@@ -98,7 +132,6 @@ class PreTrainModel(pl.LightningModule):
         self.max_idx = MAPPING.max()
         self.loss_fn = nn.CrossEntropyLoss(reduction="none")
         self.epi_loss_fn = nn.MSELoss(reduction="none")
-        self.energy_loss_fct = nn.MSELoss()
         self.per_nt_classifier = nn.Linear(hidden_dim, 25)
         self.per_nt_epi_head = nn.Linear(hidden_dim, num_epi)
         self.auprc = MulticlassAveragePrecision(num_classes=25)
@@ -109,6 +142,8 @@ class PreTrainModel(pl.LightningModule):
         self.atac_weight = atac_weight
         self.atac_head = nn.Linear(hidden_dim, num_atac) if num_atac > 0 else None
         self.atac_loss_fn = nn.MSELoss()
+        # Per-sample so the hybrid-energy loss can be masked on bulged samples.
+        self.energy_loss_fct = nn.MSELoss(reduction="none")
 
 
 
@@ -121,14 +156,78 @@ class PreTrainModel(pl.LightningModule):
         logits = self.per_nt_classifier(hidden)
         return logits, epi_logits, cls_logits, atac_logits
     
+    def unpack_batch(self, batch):
+        """Split a batch into the seven core fields and the bulge labels.
+
+        Batches from :class:`~CRISCross.Datasets.GenomicDataset` have seven
+        fields; the bulge-aware sampler appends ``align``, ``edits`` and
+        ``gapless``. Missing labels are filled in with their gapless values, so
+        callers never have to branch on the sampler.
+
+        Args:
+            batch: The tuple produced by the dataloader.
+
+        Returns:
+            ``(core, align, edits, gapless)`` where ``core`` is the original
+            seven-tuple, ``align`` is ``[B, 23]`` band columns per guide
+            position (``-1`` = unpaired), ``edits`` is ``[B, 3]`` or ``None``,
+            and ``gapless`` is a float ``[B]`` mask.
+        """
+        core = tuple(batch[:7])
+        target_x = core[0]
+        device = target_x.device
+        batch_size = target_x.shape[0]
+
+        if len(batch) > 7:
+            align = batch[7].long()
+        else:
+            align = identity_alignment(self.band_w, device).unsqueeze(0).expand(batch_size, -1)
+        edits = batch[8].long() if len(batch) > 8 else None
+        if len(batch) > 9:
+            gapless = batch[9].to(device=device, dtype=torch.float).view(-1)
+        else:
+            gapless = torch.ones(batch_size, device=device)
+        return core, align, edits, gapless
+
+    def gather_band(self, band, align):
+        """Pick, for every guide position, the band column it is paired with.
+
+        Args:
+            band: ``[B, band_w]`` (or ``[B, band_w, F]``) band tensor.
+            align: ``[B, 23]`` band column indices; ``-1`` for unpaired.
+
+        Returns:
+            ``[B, 23]`` (or ``[B, 23, F]``). Unpaired entries take the value at
+            column 0 and must be discarded by the caller via ``align >= 0``.
+        """
+        safe = align.clamp_min(0)
+        if band.dim() == 3:
+            safe = safe.unsqueeze(-1).expand(-1, -1, band.shape[-1])
+        return torch.gather(band, 1, safe)
+
+    def diagonal_columns(self, batch_size, device):
+        """The fixed gapless diagonal, ``[B, 23]``.
+
+        Used for everything that touches the model *input*. It carries no
+        sample-specific information, so it cannot leak the bulge configuration.
+        """
+        return identity_alignment(self.band_w, device).unsqueeze(0).expand(batch_size, -1)
+
+    def _scatter_mask(self, columns, values, width):
+        """One-hot scatter of ``values`` ``[B, 23]`` onto ``[B, width]`` columns."""
+        onehot = F.one_hot(columns, width).bool() & values.unsqueeze(-1)
+        return onehot.any(dim=1)
+
     def mask_shit(self, batch):
-        target_x, off_target_x, epi, y, counts, strands, atac = batch
+        core, align, edits, gapless = self.unpack_batch(batch)
+        target_x, off_target_x, epi = core[0], core[1], core[2]
         batch_size, seq_len = target_x.shape
-        center = off_target_x.shape[1] // 2 + off_target_x.shape[1] % 2
+        bs, be = self.band_start, self.band_end
         target_x = target_x.clone()
 
-
-        # Generate a random mask
+        # Generate a random mask. Note this is uniform over all guide positions,
+        # including unpaired ones: the masking rate must not depend on the bulge
+        # configuration.
         mask_tensor = (torch.rand(batch_size, seq_len, device=target_x.device) < self.mask_prob)
         empty = mask_tensor.sum(dim=1) == 0
         if empty.any():
@@ -151,37 +250,59 @@ class PreTrainModel(pl.LightningModule):
         )
         target_x[random_mask] = random_tokens[random_mask]
 
+        # The band is masked along the FIXED diagonal, not along the true
+        # alignment: a band mask that followed the alignment would let the model
+        # recover the alignment by lining up the two zero patterns.
+        diag = self.diagonal_columns(batch_size, target_x.device)
         off_target_x = off_target_x.clone()
-        off_target_x[:, center - 23//2 - 1:center+23//2] = off_target_x[:, center - 23//2 - 1:center+23//2].masked_fill(mask_mask, 0)
-
+        band_mask = self._scatter_mask(diag, mask_mask, self.band_w)
+        off_target_x[:, bs:be] = off_target_x[:, bs:be].masked_fill(band_mask, 0)
 
         epi = epi.clone()
         if len(epi.shape) > 1:
-            epi[:, center - 23//2 - 1:center+23//2] = epi[:, center - 23//2 - 1:center+23//2].masked_fill(mask_tensor.unsqueeze(-1), 0)
+            epi_band_mask = self._scatter_mask(diag, mask_tensor, self.band_w)
+            epi[:, bs:be] = epi[:, bs:be].masked_fill(epi_band_mask.unsqueeze(-1), 0)
             d = torch.randint(low=0, high=min(32, self.windowsize // 2), size=(1,))
             B, T = epi.shape[0:2]
             if self.extra_epi_mask:
+                center = self.band_end - SITE_LEN // 2
                 d = torch.randint(min(self.windowsize // 2, 128 // 2), min(128 // 2, self.windowsize // 2)+1, (B,), device=epi.device)
-                idx = torch.arange(T, device=epi.device).unsqueeze(0) 
+                idx = torch.arange(T, device=epi.device).unsqueeze(0)
                 epi_mask = (idx >= (center - d).unsqueeze(1)) & (idx < (center + d).unsqueeze(1))
 
                 epi[epi_mask] = 0
         else:
             epi_mask = torch.zeros(epi.shape)
         return target_x, off_target_x, epi, mask_tensor
-        
 
-    def compute_tokenized_target(self, target_x, off_target_x, mask):
+
+    def compute_tokenized_target(self, target_x, off_target_x, mask, align=None):
+        """Build the paired (guide base, target base) MLM label.
+
+        The target base is read at the position the guide position is *aligned
+        to*, which is the diagonal for gapless samples and a shifted diagonal
+        after a bulge. The label is only meaningful where the guide position has
+        a partner, so ``mask`` should already exclude unpaired positions.
+
+        Args:
+            target_x: ``[B, 23]`` unmasked guide.
+            off_target_x: ``[B, window]`` unmasked window.
+            mask: ``[B, 23]`` boolean supervision mask.
+            align: ``[B, 23]`` band columns; defaults to the gapless diagonal.
+
+        Returns:
+            ``[B, 23]`` long label tensor.
+        """
         bs, slen = target_x.shape
-        center = off_target_x.shape[1] // 2 + off_target_x.shape[1] % 2
-
-        centered_off_target_x = off_target_x[:, center - 23//2 - 1:center+23//2].clone()
-
+        if align is None:
+            align = self.diagonal_columns(bs, target_x.device)
+        band = off_target_x[:, self.band_start:self.band_end]
+        aligned_ot = self.gather_band(band, align)
 
         y1 = torch.zeros((bs, slen), dtype=torch.long).to(target_x.device)
         y2 = torch.zeros((bs, slen), dtype=torch.long).to(target_x.device)
         y1[mask] = target_x[mask].to(torch.long)
-        y2[mask] = centered_off_target_x[mask].to(torch.long)
+        y2[mask] = aligned_ot[mask].to(torch.long)
 
         #y1[y1 > 1] -= 2
         #y2[y2 > 1] -= 2
@@ -192,23 +313,35 @@ class PreTrainModel(pl.LightningModule):
 
 
     def general_step(self, batch):
-        target_x, off_target_x, epi, y, counts, strands, atac = batch
+        core, align, edits, gapless = self.unpack_batch(batch)
+        target_x, off_target_x, epi, y, counts, strands, atac = core
         masked_target, masked_ot, epi_masked, mask = self.mask_shit(batch)
-        center = off_target_x.shape[1] // 2 + off_target_x.shape[1] % 2
-        assert (off_target_x[:, center - 23//2 - 1:center+23//2] == target_x).sum(axis=1).min() >= 15
+
+        band = off_target_x[:, self.band_start:self.band_end]
+        aligned_ot = self.gather_band(band, align)
+        paired = align >= 0
+        # Identity along the ground-truth alignment. Bounded below by
+        # 23 - (m + b_R) >= 17 for a sample within the edit budget.
+        assert ((aligned_ot == target_x) & paired).sum(axis=1).min() >= 15
+
+        # Unpaired guide positions (RNA bulges) have no target partner, so the
+        # paired-token label is undefined there: mask the loss, not the input.
+        mask = mask & paired
 
         bs, slen = target_x.shape
-        y = self.compute_tokenized_target(target_x=target_x, off_target_x=off_target_x, mask=mask)
+        y = self.compute_tokenized_target(target_x=target_x, off_target_x=off_target_x, mask=mask, align=align)
         if len(epi.shape) == 1:
             logits, epi_logits, cls_logits, atac_logits = self(masked_target, masked_ot, None, strands)
             epi_loss = torch.zeros(epi_logits.shape, device=epi_logits.device)
         else:
             logits, epi_logits, cls_logits, atac_logits = self(masked_target, masked_ot, epi_masked, strands)
-            epi_loss = self.epi_loss_fn(epi_logits, epi[:, center - 23//2 - 1:center+23//2]) * mask[..., None]
+            aligned_epi = self.gather_band(epi[:, self.band_start:self.band_end], align)
+            epi_loss = self.epi_loss_fn(epi_logits, aligned_epi) * mask[..., None]
         masked_loss = self.loss_fn(logits.flatten(start_dim=0, end_dim=1), y.flatten()) * mask[..., None].flatten()
 
-        clsloss = masked_loss.sum() / mask.sum()
-        epi_loss = epi_loss.sum(dim=(0,1)) / mask.sum()
+        n_supervised = mask.sum().clamp_min(1)
+        clsloss = masked_loss.sum() / n_supervised
+        epi_loss = epi_loss.sum(dim=(0,1)) / n_supervised
 
         if self.training:
             lr = self.optimizers().param_groups[0]["lr"]
@@ -218,17 +351,26 @@ class PreTrainModel(pl.LightningModule):
         loss = clsloss  # + epi_loss
 
         if self.use_energy:
-            energy_loss = self.energy_loss_fct(cls_logits.squeeze(), counts.to(torch.float))
+            # The R-loop energy model of CRISPRoff is defined only for ungapped
+            # guide-target pairs, so the hybrid-energy objective is supervised
+            # on the ungapped subset and normalised over it, per batch. The mask
+            # is not a model input, so the model cannot condition on it.
+            per_sample = self.energy_loss_fct(cls_logits.squeeze(-1), counts.to(torch.float))
+            energy_loss = (per_sample * gapless).sum() / gapless.sum().clamp_min(1)
             if self.training:
                 self.log("energy_loss", energy_loss, on_step=False, on_epoch=True, prog_bar=True)
+                self.log("energy_supervised_frac", gapless.mean(), on_step=False, on_epoch=True)
             loss = loss + energy_loss
 
-        # ATAC regression: predict mean ATAC signal over the center 23nt protospacer
-        # atac_logits: [B, num_atac] — from mean-pooled hidden states 
-        # atac_true:   [B, num_atac] — mean of the 23 per-nucleotide ATAC values
+        # ATAC regression: predict mean ATAC signal over the PAM-anchored band.
+        # atac_logits: [B, num_atac] — from mean-pooled hidden states
+        # atac_true:   [B, num_atac] — mean of the per-nucleotide ATAC values.
+        # The band is a fixed genomic interval, so this stays well-defined for a
+        # bulged sample: the ATAC track is indexed by coordinate, and the window
+        # handed to the model is contiguous and ungapped by construction.
         atac_loss = torch.tensor(0.0, device=loss.device)
         if self.atac_head is not None and isinstance(atac, torch.Tensor) and atac.shape[-1] > 0:
-            atac_true = atac[:, center - 23//2 - 1:center + 23//2].mean(dim=1).to(atac_logits.dtype)
+            atac_true = atac[:, self.band_start:self.band_end].mean(dim=1).to(atac_logits.dtype)
             atac_loss = self.atac_loss_fn(atac_logits, atac_true)
             loss = loss + self.atac_weight * atac_loss
 
@@ -289,6 +431,31 @@ class PreTrainModel(pl.LightningModule):
     
 
 
+def _parse_bulge_profile(profile):
+    """Accept a bulge profile written the way JSON can express it.
+
+    JSON object keys must be strings, so ``{"1,0": 0.12}`` is the on-disk form
+    of ``{(1, 0): 0.12}``. A dict that already uses tuple keys is passed
+    through, as is ``None``.
+
+    Args:
+        profile: ``None``, ``{(b_D, b_R): weight}``, or ``{"b_D,b_R": weight}``.
+
+    Returns:
+        ``None`` or a dict with tuple keys.
+    """
+    if profile is None:
+        return None
+    out = {}
+    for key, weight in profile.items():
+        if isinstance(key, str):
+            b_D, b_R = (int(v) for v in key.split(","))
+        else:
+            b_D, b_R = key
+        out[(int(b_D), int(b_R))] = float(weight)
+    return out
+
+
 def run_pretraining(config):
     batch_size = config["batch_size"]
     hidden_dim = config["hidden_dim"]
@@ -310,7 +477,32 @@ def run_pretraining(config):
     num_atac = len(atac_features)
     atac_weight = config.get("atac_weight", 0.1)
 
+    # --- bulge settings ----------------------------------------------------
+    # Omit every one of these and the run is bit-for-bit the original
+    # mismatch-only pretraining. "bulge_rate" is the knob for the
+    # 0/5/20/50/100 % ablation sweep; a JSON config cannot express tuple keys,
+    # so "bulge_profile" accepts {"b_D,b_R": weight} strings as well.
+    band_delta = config.get("band_delta", 0)
+    bulge_rate = config.get("bulge_rate", None)
+    bulge_profile = _parse_bulge_profile(config.get("bulge_profile", None))
+    bulge_kwargs = dict(
+        band_delta=band_delta,
+        bulge_profile=bulge_profile,
+        bulge_rate=bulge_rate,
+        require_pam=config.get("require_pam", False),
+        mismatch_span=config.get("mismatch_span", "site"),
+        mismatch_base_factor=config.get("mismatch_base_factor", 3),
+        position_tilt=config.get("position_tilt", 0.0),
+        mismatch_tilt=config.get("mismatch_tilt", 0.0),
+        canonicalise_homopolymers=config.get("canonicalise_homopolymers", True),
+        emit_decoy=config.get("emit_decoy", False),
+    )
+
     print(f"[CONFIG] batch_size={batch_size}, windowsize={windowsize}, seed={seed}, lr={lr}")
+    print(
+        f"[CONFIG] band_delta={band_delta}, bulge_rate={bulge_rate}, "
+        f"bulge_profile={'default' if bulge_profile is None else bulge_profile}"
+    )
     print(f"[CONFIG] epi_features ({len(epi_features)}): {epi_features}")
     print(f"[CONFIG] num_epi={num_epi}, atac_features={atac_features}, num_atac={num_atac}")
     if torch.cuda.is_available():
@@ -339,6 +531,7 @@ def run_pretraining(config):
         mode=epi_mode,
         atac_features=atac_features,
         norm_num_samples=norm_num_samples,
+        **bulge_kwargs,
     )
     model = PreTrainModel(
         context_layers=neighborhood_layers,
@@ -353,6 +546,7 @@ def run_pretraining(config):
         use_energy=config["use_energy"],
         num_atac=num_atac,
         atac_weight=atac_weight,
+        band_delta=band_delta,
     )
     print(f"[MODEL] Built PreTrainModel with {model.hparams.n_trainable_params:,} trainable parameters")
 
